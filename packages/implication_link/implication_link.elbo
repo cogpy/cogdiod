@@ -1,0 +1,84 @@
+;;; implication_link.elbo — Elbo source for the ImplicationLink atom type
+;;;
+;;; An ImplicationLink encodes a probabilistic implication:
+;;;   ImplicationLink(A, B)  ≡  P(B|A)
+;;;
+;;; As a Dis VM isolate, it:
+;;;   - Monitors the TruthValue of its antecedent (A) via an incoming channel
+;;;   - Holds its own TV as the conditional probability P(B|A)
+;;;   - When A's TV changes, applies PLN Forward Chaining (Deduction) to
+;;;     compute a new TV for B and sends it downstream
+;;;   - Participates in ECAN attention spreading
+;;;
+;;; This is the core reactive inference engine of the CogDiod architecture.
+;;; A network of ImplicationLinks forms a distributed forward-chaining
+;;; inference graph that executes entirely through message passing.
+
+(elbo-module ImplicationLink
+  (version 1)
+  (author  "CogDiod Kernel")
+
+  (import AtomSpace "atomspace.m"
+    (get-tv set-tv broadcast request-tv))
+
+  (import PLN "pln.m"
+    (deduce revise))
+
+  (import ECAN "ecan.m"
+    (spread-sti))
+
+  (state
+    (tv           :SimpleTruthValue (strength 0.5) (confidence 0.1))
+    (antecedent-tv :SimpleTruthValue (strength 0.0) (confidence 0.0))
+    (consequent-tv :SimpleTruthValue (strength 0.0) (confidence 0.0)))
+
+  ;; ── init ──────────────────────────────────────────────────────────────
+  (defun init (self)
+    ;; Request current TVs from both ends of the implication
+    (request-tv antecedent-channel)
+    (request-tv consequent-channel))
+
+  ;; ── on-message ────────────────────────────────────────────────────────
+  (defun on-message (self msg)
+    (cond
+
+      ;; Antecedent (A) changed — forward-chain to compute new TV for B
+      ((and (eq? (msg-type msg) :SourceChanged)
+            (eq? (msg-sender msg) antecedent-uuid))
+       (set! antecedent-tv (msg-tv msg))
+       (forward-chain! self))
+
+      ;; Direct update to this implication's own TV (e.g., from learning)
+      ((eq? (msg-type msg) :UpdateTV)
+       (set! tv (PLN:revise tv (msg-tv msg)))
+       ;; Re-run forward chaining with updated conditional probability
+       (forward-chain! self))
+
+      ;; Attention allocation
+      ((eq? (msg-type msg) :Attend)
+       (set! sti (+ sti (msg-sti msg)))
+       (ECAN:spread-sti self sti outgoing-channels))
+
+      (else nil)))
+
+  ;; ── PLN Forward Chaining ─────────────────────────────────────────────
+  ;;
+  ;; Given:
+  ;;   antecedent-tv = P(A)
+  ;;   tv            = P(B|A)   (this link's own TV)
+  ;;
+  ;; Compute:
+  ;;   inferred-b-tv = PLN:deduce(tv, antecedent-tv)
+  ;;                 ≈ P(B) = P(B|A) * P(A)   (independence assumption)
+  ;;
+  ;; Then send the inferred TV downstream to the consequent node.
+  (defun forward-chain! (self)
+    (let ((inferred-tv (PLN:deduce tv antecedent-tv)))
+      ;; Only propagate if the inference is meaningful
+      (when (> (tv-confidence inferred-tv) 0.01)
+        (send consequent-channel
+              (make-msg :UpdateTV inferred-tv)))))
+
+  ;; ── on-gc ─────────────────────────────────────────────────────────────
+  (defun on-gc (self)
+    (broadcast incoming-channels (make-msg :Destroy (uuid self)))))

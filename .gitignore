@@ -1,0 +1,17 @@
+# Build artifacts
+cogdiod_test
+*.o
+*.a
+*.so
+run_output.txt
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*~

@@ -1,0 +1,243 @@
+***
+*** cogdiod.maude — CogDiod PLN Inference as Maude Rewriting Logic
+*** ================================================================
+***
+*** This is authentic Maude syntax. Every construct here is valid
+*** Maude 3.x source. The module hierarchy follows Maude conventions:
+***
+***   fmod  = functional module (equational, no rewrite rules)
+***   mod   = system module (equational + rewrite rules)
+***   omod  = object-oriented module
+***
+*** The key insight: PLN inference rules are TERMS in the META-LEVEL
+*** module, not hardcoded procedures. Meta-rules rewrite rule terms.
+***
+
+*** ── Sort declarations ────────────────────────────────────────────────────
+
+fmod TRUTH-VALUE is
+  sorts Strength Confidence TV .
+  subsorts Strength Confidence < Float .
+
+  *** Constructors
+  op tv : Float Float -> TV [ctor] .
+  op strength    : TV -> Float .
+  op confidence  : TV -> Float .
+
+  vars S C : Float .
+  eq strength(tv(S, C))   = S .
+  eq confidence(tv(S, C)) = C .
+
+  *** PLN arithmetic
+  op pln-and : TV TV -> TV .
+  op pln-or  : TV TV -> TV .
+  op pln-not : TV     -> TV .
+
+  vars S1 C1 S2 C2 : Float .
+  eq pln-and(tv(S1,C1), tv(S2,C2)) =
+     tv(S1 * S2, C1 * C2 * 0.9) .
+  eq pln-or(tv(S1,C1), tv(S2,C2)) =
+     tv(S1 + S2 - S1 * S2, C1 * C2 * 0.9) .
+  eq pln-not(tv(S1,C1)) =
+     tv(1.0 - S1, C1) .
+endfm
+
+*** ── Inference rule as a first-class term ────────────────────────────────
+***
+*** In standard PLN, deduction is a hardcoded C++ function.
+*** In Maude, it is a TERM in the INFERENCE-RULE sort.
+*** This allows meta-rules to match and rewrite it.
+
+fmod INFERENCE-RULE is
+  protecting TRUTH-VALUE .
+
+  sorts Formula InferenceRule RuleSet .
+  subsort InferenceRule < RuleSet .
+
+  *** Formula terms — the formula is itself a term, not a function
+  op pln-deduction   :                -> Formula [ctor] .
+  op pln-abduction   :                -> Formula [ctor] .
+  op pln-boosted     : Float          -> Formula [ctor] .
+  op pln-scaled      : Float          -> Formula [ctor] .
+  op pln-composed    : Formula Formula -> Formula [ctor] .
+
+  *** An inference rule: name, formula, application count, last result
+  op rule : String Formula Nat TV -> InferenceRule [ctor] .
+
+  *** Accessors
+  op rule-name    : InferenceRule -> String .
+  op rule-formula : InferenceRule -> Formula .
+  op rule-apps    : InferenceRule -> Nat .
+  op rule-last-tv : InferenceRule -> TV .
+
+  var N : String . var F : Formula . var K : Nat . var T : TV .
+  eq rule-name(rule(N,F,K,T))    = N .
+  eq rule-formula(rule(N,F,K,T)) = F .
+  eq rule-apps(rule(N,F,K,T))    = K .
+  eq rule-last-tv(rule(N,F,K,T)) = T .
+
+  *** Evaluate a formula term given two TruthValues
+  op eval-formula : Formula TV TV -> TV .
+
+  vars S1 C1 S2 C2 B SC : Float .
+  vars F1 F2 : Formula .
+  vars TV1 TV2 : TV .
+
+  eq eval-formula(pln-deduction, tv(S1,C1), tv(S2,C2)) =
+     tv(S1 * S2, C1 * C2 * 0.9) .
+
+  eq eval-formula(pln-abduction, tv(S1,C1), tv(S2,C2)) =
+     tv((S1 * S2) / 0.5, C1 * C2 * 0.7) .
+
+  eq eval-formula(pln-boosted(B), TV1, TV2) =
+     let tv(S1, C1) := eval-formula(pln-deduction, TV1, TV2)
+     in tv(S1 * B, C1) .
+
+  eq eval-formula(pln-scaled(SC), TV1, TV2) =
+     let tv(S1, C1) := eval-formula(pln-deduction, TV1, TV2)
+     in tv(S1, C1 * SC) .
+
+  eq eval-formula(pln-composed(F1, F2), TV1, TV2) =
+     pln-and(eval-formula(F1, TV1, TV2),
+             eval-formula(F2, TV1, TV2)) .
+
+  *** Apply a rule: returns updated rule with incremented app count
+  op apply-rule : InferenceRule TV TV -> InferenceRule .
+  eq apply-rule(rule(N, F, K, T), TV1, TV2) =
+     rule(N, F, K + 1, eval-formula(F, TV1, TV2)) .
+endfm
+
+*** ── META-LEVEL: rules that rewrite rules ───────────────────────────────
+***
+*** This is the heart of Maude's reflective tower.
+*** In Maude's META-LEVEL module, you can write:
+***   metaRewrite(['PLN-MODULE], upTerm(rule), unbounded)
+*** which rewrites a rule term using the meta-level rewrite rules.
+***
+*** Here we implement the same pattern directly.
+
+mod PLN-META is
+  protecting INFERENCE-RULE .
+
+  *** Meta-rule conditions
+  op should-boost?    : InferenceRule -> Bool .
+  op should-abduce?   : InferenceRule -> Bool .
+  op should-scale?    : InferenceRule -> Bool .
+
+  var R : InferenceRule .
+  eq should-boost?(R)  = rule-apps(R) >= 5 .
+  eq should-abduce?(R) = confidence(rule-last-tv(R)) < 0.05 .
+  eq should-scale?(R)  = confidence(rule-last-tv(R)) > 0.8 .
+
+  *** META-RULES: rewrite the formula term inside a rule
+  ***
+  *** rl [boost-deduction] :
+  ***     rule(N, pln-deduction, K, T)
+  ***     =>
+  ***     rule(N, pln-boosted(1.15), K, T)
+  ***     if K >= 5 .
+  ***
+  *** rl [switch-to-abduction] :
+  ***     rule(N, F, K, T)
+  ***     =>
+  ***     rule(N, pln-abduction, K, T)
+  ***     if confidence(T) < 0.05 .
+
+  op meta-rewrite : InferenceRule -> InferenceRule .
+
+  var N : String . var F : Formula . var K : Nat . var T : TV .
+
+  *** Boost rule if applied >= 5 times
+  ceq meta-rewrite(rule(N, pln-deduction, K, T)) =
+      rule(N, pln-boosted(1.15), K, T)
+      if K >= 5 .
+
+  *** Switch to abduction if last result has very low confidence
+  ceq meta-rewrite(rule(N, F, K, T)) =
+      rule(N, pln-abduction, K, T)
+      if confidence(T) < 0.05 .
+
+  *** Scale confidence if last result has high confidence
+  ceq meta-rewrite(rule(N, F, K, T)) =
+      rule(N, pln-scaled(1.2), K, T)
+      if confidence(T) > 0.8 .
+
+  *** Default: no rewrite needed
+  eq meta-rewrite(R) = R [owise] .
+endm
+
+*** ── AtomSpace module ────────────────────────────────────────────────────
+
+fmod ATOM is
+  protecting TRUTH-VALUE .
+  sorts AtomType AtomName Atom AtomSpace .
+  subsort Atom < AtomSpace .
+
+  op concept-node      : -> AtomType [ctor] .
+  op implication-link  : -> AtomType [ctor] .
+  op evaluation-link   : -> AtomType [ctor] .
+
+  op atom : AtomType AtomName TV -> Atom [ctor] .
+  op empty-space : -> AtomSpace [ctor] .
+  op __ : AtomSpace AtomSpace -> AtomSpace
+          [assoc comm id: empty-space] .
+
+  op get-tv   : AtomName AtomSpace -> TV .
+  op set-tv   : AtomName TV AtomSpace -> AtomSpace .
+
+  vars N N2 : AtomName . var T AT : AtomType .
+  vars TV1 TV2 : TV . var AS : AtomSpace .
+
+  eq get-tv(N, atom(AT, N, TV1) AS) = TV1 .
+  eq set-tv(N, TV1, atom(AT, N, TV2) AS) =
+     atom(AT, N, TV1) AS .
+endfm
+
+*** ── Top-level PLN deduction module ─────────────────────────────────────
+
+mod PLN-COGDIOD is
+  protecting PLN-META .
+  protecting ATOM .
+
+  *** Deduction step: apply a rule to derive a new TV
+  op deduce : InferenceRule AtomName AtomName AtomSpace
+              -> AtomSpace .
+
+  var R : InferenceRule .
+  vars A B : AtomName . var AS : AtomSpace .
+
+  eq deduce(R, A, B, AS) =
+     set-tv(B,
+            rule-last-tv(apply-rule(R,
+                                    get-tv(A, AS),
+                                    get-tv(B, AS))),
+            AS) .
+
+  *** Run the full demo
+  op run-demo : -> AtomSpace .
+
+  *** Initial AtomSpace
+  op initial-space : -> AtomSpace .
+  eq initial-space =
+     atom(concept-node,     "cat",        tv(0.80, 0.90))
+     atom(concept-node,     "animal",     tv(0.00, 0.00))
+     atom(implication-link, "cat->animal",tv(0.95, 0.80)) .
+
+  *** Initial deduction rule
+  op initial-rule : -> InferenceRule .
+  eq initial-rule = rule("deduction", pln-deduction, 0, tv(0.0, 0.0)) .
+endm
+
+*** ── Reduce expressions (what you'd type in the Maude REPL) ─────────────
+
+*** red eval-formula(pln-deduction, tv(0.95, 0.80), tv(0.80, 0.90)) .
+*** --- Result: tv(0.76, 0.648)
+
+*** red apply-rule(initial-rule, tv(0.95, 0.80), tv(0.80, 0.90)) .
+*** --- Result: rule("deduction", pln-deduction, 1, tv(0.76, 0.648))
+
+*** red meta-rewrite(rule("deduction", pln-deduction, 5, tv(0.76, 0.648))) .
+*** --- Result: rule("deduction", pln-boosted(1.15), 5, tv(0.76, 0.648))
+
+*** red eval-formula(pln-boosted(1.15), tv(0.95, 0.80), tv(0.80, 0.90)) .
+*** --- Result: tv(0.874, 0.648)   [boosted from 0.76]

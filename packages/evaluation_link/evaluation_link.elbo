@@ -1,0 +1,78 @@
+;;; evaluation_link.elbo — Elbo source for the EvaluationLink atom type
+;;;
+;;; An EvaluationLink asserts that a predicate holds for a list of arguments.
+;;; Structurally: EvaluationLink(PredicateNode, ListLink(arg1, arg2, ...))
+;;;
+;;; As a Dis VM isolate, the EvaluationLink:
+;;;   - Monitors the TruthValue of its PredicateNode (via incoming channel)
+;;;   - Monitors the TruthValues of its argument nodes (via incoming channels)
+;;;   - Computes its own TruthValue as the conjunction of predicate + args
+;;;   - Propagates changes downstream to any links that depend on it
+;;;
+;;; This makes EvaluationLink a reactive, event-driven truth maintainer.
+
+(elbo-module EvaluationLink
+  (version 1)
+  (author  "CogDiod Kernel")
+
+  (import AtomSpace "atomspace.m"
+    (get-tv set-tv broadcast))
+
+  (import PLN "pln.m"
+    (conjunction revise))
+
+  (state
+    (tv          :SimpleTruthValue (strength 0.0) (confidence 0.0))
+    (predicate-tv :SimpleTruthValue (strength 0.0) (confidence 0.0))
+    (arg-tvs     :list '()))
+
+  ;; ── init ──────────────────────────────────────────────────────────────
+  (defun init (self)
+    ;; Request current TVs from predicate and argument channels
+    (request-tv predicate-channel)
+    (for-each request-tv arg-channels))
+
+  ;; ── on-message ────────────────────────────────────────────────────────
+  (defun on-message (self msg)
+    (cond
+
+      ;; Predicate node updated
+      ((eq? (msg-type msg) :SourceChanged)
+       (let ((sender (msg-sender msg))
+             (new-tv (msg-tv msg)))
+         ;; Determine if this is the predicate or an argument
+         (if (eq? sender predicate-uuid)
+             (set! predicate-tv new-tv)
+             (update-arg-tv! sender new-tv))
+         ;; Recompute our TV as conjunction of all inputs
+         (recompute-tv! self)))
+
+      ((eq? (msg-type msg) :UpdateTV)
+       ;; Direct override (e.g., from learning)
+       (set! tv (PLN:revise tv (msg-tv msg)))
+       (broadcast outgoing-channels (make-msg :SourceChanged tv)))
+
+      (else nil)))
+
+  ;; ── helpers ───────────────────────────────────────────────────────────
+  (defun recompute-tv! (self)
+    (let ((new-tv (PLN:conjunction predicate-tv arg-tvs)))
+      (when (tv-changed? tv new-tv)
+        (set! tv new-tv)
+        (broadcast outgoing-channels (make-msg :SourceChanged tv)))))
+
+  (defun update-arg-tv! (sender-uuid new-tv)
+    (set! arg-tvs
+          (map (lambda (entry)
+                 (if (eq? (car entry) sender-uuid)
+                     (cons sender-uuid new-tv)
+                     entry))
+               arg-tvs)))
+
+  (defun tv-changed? (old new)
+    (or (> (abs (- (tv-strength old) (tv-strength new))) 0.001)
+        (> (abs (- (tv-confidence old) (tv-confidence new))) 0.001)))
+
+  ;; ── on-gc ─────────────────────────────────────────────────────────────
+  (defun on-gc (self)
+    (broadcast incoming-channels (make-msg :Destroy (uuid self)))))

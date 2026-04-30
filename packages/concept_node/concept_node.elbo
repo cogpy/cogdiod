@@ -1,0 +1,83 @@
+;;; concept_node.elbo — Elbo source for the ConceptNode atom type
+;;;
+;;; A ConceptNode is the most fundamental atom: it represents a named
+;;; concept with a TruthValue (how true/present the concept is) and an
+;;; AttentionValue (how much cognitive focus it currently receives).
+;;;
+;;; Behaviour:
+;;;   (init)        — set default TV and register with ECAN
+;;;   (on-message)  — handle UpdateTV, Attend, and SourceChanged messages
+;;;   (on-gc)       — notify incoming links before reclamation
+;;;
+;;; Compiled target: ConceptNode.dis (Dis VM bytecode)
+;;; Packaged as:     ConceptNode.elm
+
+(elbo-module ConceptNode
+  (version 1)
+  (author  "CogDiod Kernel")
+
+  ;; ── Imports ──────────────────────────────────────────────────────────
+  (import AtomSpace  "atomspace.m"
+    (get-tv set-tv get-sti set-sti broadcast))
+
+  (import ECAN "ecan.m"
+    (spread-sti decay-sti))
+
+  (import PLN "pln.m"
+    (revise))
+
+  ;; ── Local state (per-isolate) ─────────────────────────────────────────
+  (state
+    (tv     :SimpleTruthValue  (strength 0.5) (confidence 0.1))
+    (sti    :float             0.0)
+    (lti    :float             0.0)
+    (name   :string            ""))
+
+  ;; ── Entry point: (init self) ──────────────────────────────────────────
+  (defun init (self)
+    ;; Load name from the 9P filename (passed in reg[12])
+    (set! name (reg 12))
+    ;; Register with ECAN for attention scheduling
+    (ECAN:register self sti)
+    ;; Announce existence to the AtomSpace index
+    (AtomSpace:register-node self name tv))
+
+  ;; ── Entry point: (on-message self msg) ───────────────────────────────
+  (defun on-message (self msg)
+    (cond
+
+      ;; External agent updated our TruthValue (e.g., learning)
+      ((eq? (msg-type msg) :UpdateTV)
+       (let ((new-tv (msg-tv msg)))
+         ;; Revise rather than replace — merge with existing evidence
+         (set! tv (PLN:revise tv new-tv))
+         ;; Propagate the change down all outgoing links
+         (broadcast outgoing-channels
+                    (make-msg :SourceChanged tv))))
+
+      ;; ECAN is sending us attention currency
+      ((eq? (msg-type msg) :Attend)
+       (let ((delta (msg-sti msg)))
+         (set! sti (+ sti delta))
+         ;; If we are highly stimulated, spread to neighbours
+         (when (> sti 2.0)
+           (ECAN:spread-sti self sti outgoing-channels)
+           (set! sti (* sti 0.5)))))
+
+      ;; A source node we depend on has changed
+      ((eq? (msg-type msg) :SourceChanged)
+       ;; Re-broadcast so downstream links can re-infer
+       (broadcast outgoing-channels
+                  (make-msg :SourceChanged tv)))
+
+      ;; Unknown message — ignore
+      (else nil)))
+
+  ;; ── Entry point: (on-gc self) ─────────────────────────────────────────
+  (defun on-gc (self)
+    ;; Notify incoming links that we are being destroyed
+    (broadcast incoming-channels
+               (make-msg :Destroy (uuid self)))
+    ;; Deregister from ECAN and AtomSpace index
+    (ECAN:deregister self)
+    (AtomSpace:deregister-node self)))
