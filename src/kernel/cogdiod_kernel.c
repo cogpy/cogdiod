@@ -164,6 +164,39 @@ ElmPackage* cogdiod_get_package(CogDiodKernel* k, uint32_t type_id) {
     return (p && p->type_id == type_id) ? p : NULL;
 }
 
+void cogdiod_unload_package(CogDiodKernel* k, uint32_t type_id) {
+    pthread_mutex_lock(&k->pkg_lock);
+    uint32_t b = pkg_bucket(type_id);
+    ElmPackage* p = k->pkg_cache[b];
+
+    if (!p || p->type_id != type_id) {
+        pthread_mutex_unlock(&k->pkg_lock);
+        return;
+    }
+
+    /* Refuse to unload while active isolates still hold references */
+    pthread_mutex_lock(&p->ref_lock);
+    uint32_t refs = p->ref_count;
+    pthread_mutex_unlock(&p->ref_lock);
+
+    if (refs > 0) {
+        pthread_mutex_unlock(&k->pkg_lock);
+        fprintf(stderr, "[cogdiod] warning: cannot unload package "
+                "type_id=0x%08x — %u active ref(s)\n", type_id, refs);
+        return;
+    }
+
+    k->pkg_cache[b] = NULL;
+    if (k->pkg_count > 0)
+        k->pkg_count--;
+    pthread_mutex_unlock(&k->pkg_lock);
+
+    pthread_mutex_destroy(&p->ref_lock);
+    free(p->dis_bytecode);
+    free(p);
+    fprintf(stderr, "[cogdiod] unloaded package type_id=0x%08x\n", type_id);
+}
+
 /* ─────────────────────────────────────────────────────────────────────────
  * Dis VM isolate initialisation
  * ───────────────────────────────────────────────────────────────────────── */
@@ -338,6 +371,62 @@ int cogdiod_recv(LimboChannel* ch, CogMessage* msg) {
     pthread_cond_signal(&ch->not_full);
     pthread_mutex_unlock(&ch->lock);
     return 0;
+}
+
+static void free_channel(LimboChannel* ch) {
+    pthread_mutex_destroy(&ch->lock);
+    pthread_cond_destroy(&ch->not_empty);
+    pthread_cond_destroy(&ch->not_full);
+    free(ch);
+}
+
+int cogdiod_unlink(CogDiodKernel* k,
+                   uint64_t src_uuid, uint64_t dst_uuid) {
+    AtomIsolate* src = cogdiod_get_atom(k, src_uuid);
+    AtomIsolate* dst = cogdiod_get_atom(k, dst_uuid);
+    if (!src || !dst) return -1;
+
+    LimboChannel* removed_out = NULL;
+
+    /* Remove the first outgoing channel from src to dst.
+     * The architecture allows at most one channel per (src, dst) pair;
+     * duplicate links are not created by cogdiod_link(). */
+    pthread_mutex_lock(&src->lock);
+    LimboChannel** pp = &src->outgoing;
+    while (*pp) {
+        if ((*pp)->dst_uuid == dst_uuid) {
+            removed_out = *pp;
+            *pp = removed_out->next;
+            src->outgoing_count--;
+            break;
+        }
+        pp = &(*pp)->next;
+    }
+    pthread_mutex_unlock(&src->lock);
+
+    /* Remove from dst's incoming list */
+    pthread_mutex_lock(&dst->lock);
+    pp = &dst->incoming;
+    while (*pp) {
+        if ((*pp)->src_uuid == src_uuid) {
+            LimboChannel* in_ch = *pp;
+            *pp = in_ch->next;
+            dst->incoming_count--;
+            free_channel(in_ch);
+            break;
+        }
+        pp = &(*pp)->next;
+    }
+    pthread_mutex_unlock(&dst->lock);
+
+    if (removed_out) {
+        free_channel(removed_out);
+        fprintf(stderr, "[cogdiod] unlinked %llu -> %llu\n",
+                (unsigned long long)src_uuid,
+                (unsigned long long)dst_uuid);
+        return 0;
+    }
+    return -1;  /* channel not found */
 }
 
 /* ─────────────────────────────────────────────────────────────────────────
