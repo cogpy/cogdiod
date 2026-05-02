@@ -1,6 +1,6 @@
 # CogDiod Makefile
 
-CC      = zig cc
+CC      = cc
 CFLAGS  = -Wall -Wextra -O2 -std=c11 -pthread \
           -Iinclude \
           -D_GNU_SOURCE \
