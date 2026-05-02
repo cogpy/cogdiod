@@ -388,7 +388,7 @@ int cogdiod_unlink(CogDiodKernel* k,
 
     LimboChannel* removed_out = NULL;
 
-    /* Remove the first outgoing channel from src to dst.
+    /* Step 1: find and remove the outgoing channel from src.
      * The architecture allows at most one channel per (src, dst) pair;
      * duplicate links are not created by cogdiod_link(). */
     pthread_mutex_lock(&src->lock);
@@ -404,7 +404,11 @@ int cogdiod_unlink(CogDiodKernel* k,
     }
     pthread_mutex_unlock(&src->lock);
 
-    /* Remove from dst's incoming list */
+    /* Step 2: bail early if no outgoing channel was found — no state changed. */
+    if (!removed_out)
+        return -1;
+
+    /* Step 3: remove the matching incoming channel from dst. */
     pthread_mutex_lock(&dst->lock);
     pp = &dst->incoming;
     while (*pp) {
@@ -419,14 +423,11 @@ int cogdiod_unlink(CogDiodKernel* k,
     }
     pthread_mutex_unlock(&dst->lock);
 
-    if (removed_out) {
-        free_channel(removed_out);
-        fprintf(stderr, "[cogdiod] unlinked %llu -> %llu\n",
-                (unsigned long long)src_uuid,
-                (unsigned long long)dst_uuid);
-        return 0;
-    }
-    return -1;  /* channel not found */
+    free_channel(removed_out);
+    fprintf(stderr, "[cogdiod] unlinked %llu -> %llu\n",
+            (unsigned long long)src_uuid,
+            (unsigned long long)dst_uuid);
+    return 0;
 }
 
 /* ─────────────────────────────────────────────────────────────────────────
