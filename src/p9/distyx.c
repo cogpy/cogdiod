@@ -405,7 +405,7 @@ int distyx_dispatch(CogDiodKernel* k,
         if (req->op == DT_OP_WRITE && p.depth == 4
             && strcmp(p.segment[3], "ctl") == 0) {
             uint64_t uuid = strtoull(p.segment[2], NULL, 10);
-            if (strncmp((char*)req->buf, "infer", 5) == 0)
+            if (req->buf_len >= 5 && strncmp((char*)req->buf, "infer", 5) == 0)
                 return distyx_handle_infer(k, uuid);
         }
 

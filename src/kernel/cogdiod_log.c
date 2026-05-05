@@ -42,5 +42,5 @@ void cogdiod_log(CogLogLevel level, const char* file, int line,
     fputc('\n', out);
     fflush(out);
 
-    if (level == LOG_FATAL) abort();
+    if (level == LOG_FATAL) { fflush(NULL); abort(); }
 }

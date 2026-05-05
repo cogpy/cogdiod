@@ -211,19 +211,9 @@ static int compile_expr(Lexer* l, Emitter* e) {
     if (t.type == TOK_LPAREN) {
         Token head = lex_next(l);
         if (head.type == TOK_SYMBOL) {
-            /* Recursively compile body expressions in a form */
-            uint8_t op;
-            if (keyword_to_opcode(head.text, &op)) {
-                emit_byte(e, op);
-                Token nxt = lex_next(l);
-                if (nxt.type != TOK_RPAREN) {
-                    fprintf(stderr, "[elbo] expected ')' after op %s\n",
-                            head.text);
-                    return -1;
-                }
+            if (compile_call(l, e, head.text) == 0)
                 return 0;
-            }
-            /* Nested form: skip to matching ) */
+            /* Unknown call: skip to matching ) */
             int depth = 1;
             while (depth > 0) {
                 Token s = lex_next(l);
@@ -277,7 +267,6 @@ static size_t compile_defun(Lexer* l, Emitter* e) {
     if (t.type == TOK_RPAREN)
         lex_next(l);
 
-    (void)compile_call;  /* suppress unused-function warning */
     return start_off;
 }
 
