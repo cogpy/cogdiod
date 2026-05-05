@@ -1,3 +1,8 @@
+# Build configuration (restored after Copilot session loss in run 67505091145)
+CC      ?= cc
+CFLAGS  ?= -Wall -Wextra -O2 -std=c11 -pthread -Iinclude -D_GNU_SOURCE -DDISVM_NREGS=16 -DDISVM_STKMAX=4096
+LDFLAGS ?= -lpthread -lm
+
 SRCS = src/kernel/cogdiod_kernel.c \
        src/kernel/cogdiod_log.c \
        src/kernel/pln.c \
