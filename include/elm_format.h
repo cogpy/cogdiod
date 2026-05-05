@@ -17,7 +17,7 @@
 
 /*
  * On-disk header — exactly 128 bytes.
- * Size check: 4+4+4+4+64+8+8+8+4+4 = 116 → pad 12 → 128
+ * Size check: 4*4 + 64 + 8*3 + 4*2 = 16+64+24+8 = 112 → pad 16 → 128
  */
 typedef struct __attribute__((packed)) {
     uint32_t magic;           /* ELM_FILE_MAGIC */
@@ -30,7 +30,7 @@ typedef struct __attribute__((packed)) {
     uint64_t ep_on_gc;        /* bytecode offset: (on-gc) entry point */
     uint32_t bytecode_size;   /* size of bytecode section in bytes */
     uint32_t symtab_count;    /* number of symbol table entries */
-    uint8_t  _pad[12];        /* padding to reach 128 bytes */
+    uint8_t  _pad[16];        /* padding to reach 128 bytes */
 } ElmFileHeader;
 
 /* Symbol table entry */
