@@ -211,15 +211,10 @@ static int distyx_handle_infer(CogDiodKernel* k, uint64_t uuid) {
     LimboChannel* ch = a->outgoing;
     while (ch) {
         cogdiod_send(ch, &msg);
-        ch = ch->next;
+        ch = ch->out_next;  /* shared-channel dual-list (Phase 1 Item 2) */
     }
     return 0;
 }
-
-/* ─────────────────────────────────────────────────────────────────────────
- * DisTyx stats serialiser
- * ───────────────────────────────────────────────────────────────────────── */
-
 
 /* ─────────────────────────────────────────────────────────────────────────
  * DisTyx stats serialiser

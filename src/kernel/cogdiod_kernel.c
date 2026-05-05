@@ -21,8 +21,9 @@
 #include <assert.h>
 #include <time.h>
 
-/* Forward declaration from elm_loader.c */
+/* Forward declarations from elm_loader.c */
 int elm_exec_msg(AtomIsolate* a, const CogMessage* msg);
+ElmPackage* elm_load_file(const char* path);
 
 /* ─────────────────────────────────────────────────────────────────────────
  * Internal helpers
