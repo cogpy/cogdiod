@@ -294,3 +294,58 @@
 (display "  Spawning a hypothesis = spawning a child isolate with overrides.\n")
 
 (close-port bridge-port)
+
+;; ── cogdiod-env->json: serialize a Guile environment to JSON ─────────────
+;;
+;; Converts an association list (env as alist) to a JSON object string.
+;; Each binding (name . value) is serialized based on the value type.
+
+(define (cogdiod-env->json env-alist)
+  (define (val->json v)
+    (cond
+      ((number?  v) (format #f "~a" v))
+      ((boolean? v) (if v "true" "false"))
+      ((string?  v) (format #f "\"~a\"" v))
+      ((pair?    v) (format #f "[~a]"
+                      (string-join (map val->json v) ",")))
+      (else          (format #f "\"~a\"" v))))
+  (string-append "{"
+    (string-join
+      (map (lambda (binding)
+             (format #f "\"~a\":~a"
+               (car binding)
+               (val->json (cdr binding))))
+           env-alist)
+      ",")
+    "}"))
+
+;; ── cogdiod-send-env: send a Guile env snapshot to the bridge ────────────
+;;
+;; Takes an alist of cognitive bindings and sends them as a series of
+;; spawn/set_tv calls so the bridge mirrors the Guile environment state.
+
+(define (cogdiod-send-env bridge-spawn-fn bridge-settv-fn env-alist)
+  "Sync env-alist to the bridge. bridge-spawn-fn takes (type name s c) → uuid.
+   bridge-settv-fn takes (uuid s c) to update an existing atom."
+  (for-each
+    (lambda (binding)
+      (let* ((name (symbol->string (car binding)))
+             (val  (cdr binding)))
+        (cond
+          ;; TV pair: (strength . confidence) — spawn then set TV
+          ((and (pair? val) (number? (car val)) (number? (cdr val)))
+           (let* ((s (car val)) (c (cdr val))
+                  (uuid (bridge-spawn-fn "ConceptNode" name s c)))
+             (bridge-settv-fn uuid s c)
+             (format #t "  [env->bridge] ~a → uuid ~a TV(~,3f,~,3f)~n"
+                     name uuid s c)))
+          ;; Plain number: treat as strength with confidence 0.9
+          ((number? val)
+           (let* ((uuid (bridge-spawn-fn "ConceptNode" name val 0.9)))
+             (bridge-settv-fn uuid val 0.9)
+             (format #t "  [env->bridge] ~a = ~a → uuid ~a~n"
+                     name val uuid)))
+          (else
+           (format #t "  [env->bridge] ~a skipped (not a TV value)~n" name)))))
+    env-alist))
+

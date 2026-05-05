@@ -288,7 +288,67 @@ sub evaluate {
     die "Unknown context: $context\n";
 }
 
-# ── Main ──────────────────────────────────────────────────────────────────
+# ── CogDiod::Agent — base class for autonomous cognitive agents ───────────
+#
+# Any package that inherits from CogDiod::Agent gets:
+#   - A bridge connection
+#   - An atom store (name → uuid)
+#   - perceive($name, $s, $c) — spawn/update a belief atom
+#   - act($uuid, $sti_delta) — attend to an atom
+#   - infer($ant_uuid, $impl_uuid) — PLN modus ponens via bridge
+#   - snapshot() — full state as JSON-decoded hashref
+
+package CogDiod::Agent;
+
+sub new {
+    my ($class, %opts) = @_;
+    my $bridge = $opts{bridge} // CogDiodBridge->new();
+    return bless {
+        bridge => $bridge,
+        atoms  => {},   # name => uuid
+    }, $class;
+}
+
+sub perceive {
+    my ($self, $name, $s, $c) = @_;
+    $s //= 0.5;  $c //= 0.5;
+    if (!exists $self->{atoms}{$name}) {
+        my $uuid = $self->{bridge}->spawn("ConceptNode", $name, $s, $c);
+        $self->{atoms}{$name} = $uuid;
+        return $uuid;
+    } else {
+        my $uuid = $self->{atoms}{$name};
+        $self->{bridge}->set_tv($uuid, $s, $c);
+        return $uuid;
+    }
+}
+
+sub act {
+    my ($self, $uuid, $delta) = @_;
+    $self->{bridge}->call(
+        sprintf('{"op":"attend","uuid":%d,"delta":%.4f}', $uuid, $delta // 1.0)
+    );
+}
+
+sub infer {
+    my ($self, $ant_uuid, $impl_uuid) = @_;
+    return $self->{bridge}->call(
+        sprintf('{"op":"pln_deduce","antecedent":%d,"implication":%d}',
+                $ant_uuid, $impl_uuid)
+    );
+}
+
+sub snapshot {
+    my ($self) = @_;
+    return $self->{bridge}->call('{"op":"snapshot"}');
+}
+
+sub atom_uuid {
+    my ($self, $name) = @_;
+    return $self->{atoms}{$name};
+}
+
+# ── main ──────────────────────────────────────────────────────────────────
 
 package main;
 

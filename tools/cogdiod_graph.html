@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>CogDiod AtomSpace Graph</title>
+<style>
+  body { margin: 0; background: #0d1117; color: #c9d1d9; font-family: monospace; }
+  #controls { padding: 8px 12px; background: #161b22; border-bottom: 1px solid #30363d; display: flex; gap: 12px; align-items: center; }
+  #controls input { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; padding: 4px 8px; border-radius: 4px; }
+  #controls button { background: #238636; color: #fff; border: none; padding: 5px 14px; border-radius: 4px; cursor: pointer; }
+  #controls button:hover { background: #2ea043; }
+  #status { font-size: 12px; color: #8b949e; }
+  svg { width: 100%; height: calc(100vh - 44px); }
+  .node circle { stroke-width: 2; cursor: pointer; }
+  .node text { font-size: 11px; fill: #e6edf3; pointer-events: none; }
+  .link { stroke: #30363d; stroke-opacity: 0.8; }
+  .tooltip { position: absolute; background: #161b22; border: 1px solid #30363d;
+             padding: 8px 12px; border-radius: 6px; font-size: 12px; pointer-events: none;
+             display: none; line-height: 1.6; }
+</style>
+</head>
+<body>
+<div id="controls">
+  <label>Bridge: <input id="host" value="ws://localhost:19999" size="28"></label>
+  <button onclick="connect()">Connect</button>
+  <button onclick="refresh()">Refresh</button>
+  <label>Poll: <input id="poll" type="number" value="2" min="0" max="60" size="4"> s</label>
+  <span id="status">disconnected</span>
+</div>
+<svg id="svg"></svg>
+<div class="tooltip" id="tip"></div>
+
+<script src="https://d3js.org/d3.v7.min.js"></script>
+<script>
+const TYPE_COLORS = {
+  ConceptNode:     '#58a6ff',
+  ImplicationLink: '#f78166',
+  EvaluationLink:  '#a5d6ff',
+  PredicateNode:   '#ffa657',
+  AndLink:         '#7ee787',
+  OrLink:          '#d2a8ff',
+};
+function typeColor(t) { return TYPE_COLORS[t] || '#8b949e'; }
+
+let sim, svg, link, node, pollTimer = null;
+let ws = null, wsReady = false;
+let atomData = { atoms: [], links: [] };
+
+/* ── WebSocket / HTTP bridge ────────────────────────────────────────────── */
+function sendReq(json, cb) {
+  if (ws && wsReady) {
+    const key = Date.now();
+    const handler = (e) => {
+      ws.removeEventListener('message', handler);
+      try { cb(JSON.parse(e.data)); } catch(_) { cb(null); }
+    };
+    ws.addEventListener('message', handler);
+    ws.send(json + '\n');
+  } else {
+    /* Fallback: mock data for offline demo */
+    setTimeout(() => cb(null), 0);
+  }
+}
+
+function connect() {
+  const url = document.getElementById('host').value;
+  if (ws) { ws.close(); ws = null; wsReady = false; }
+  try {
+    ws = new WebSocket(url);
+    ws.onopen  = () => { wsReady = true; setStatus('connected'); refresh(); };
+    ws.onclose = () => { wsReady = false; setStatus('disconnected'); };
+    ws.onerror = () => { wsReady = false; setStatus('error'); };
+  } catch(e) { setStatus('WebSocket not supported'); }
+  startPoll();
+}
+
+function setStatus(s) { document.getElementById('status').textContent = s; }
+
+/* ── Data fetching ──────────────────────────────────────────────────────── */
+function refresh() {
+  sendReq('{"op":"snapshot"}', data => {
+    if (!data || !data.atoms) return;
+    const nodeMap = {};
+    const nodes = data.atoms.map(a => {
+      nodeMap[a.uuid] = a;
+      return { id: a.uuid, label: a.name, type: a.type || 'ConceptNode',
+               s: a.strength || 0, c: a.confidence || 0, sti: a.sti || 0 };
+    });
+    const links = [];
+    data.atoms.forEach(a => {
+      (a.links || []).forEach(dst => {
+        if (nodeMap[dst]) links.push({ source: a.uuid, target: dst });
+      });
+    });
+    atomData = { nodes, links };
+    render(atomData);
+  });
+}
+
+function startPoll() {
+  if (pollTimer) clearInterval(pollTimer);
+  const sec = parseFloat(document.getElementById('poll').value);
+  if (sec > 0) pollTimer = setInterval(refresh, sec * 1000);
+}
+
+/* ── D3 force graph ─────────────────────────────────────────────────────── */
+function render({ nodes, links: linkData }) {
+  const svgEl = document.getElementById('svg');
+  const W = svgEl.clientWidth, H = svgEl.clientHeight;
+  const tip = document.getElementById('tip');
+
+  d3.select('#svg').selectAll('*').remove();
+  const root = d3.select('#svg').append('g');
+
+  d3.select('#svg').call(
+    d3.zoom().scaleExtent([0.1, 4]).on('zoom', e => root.attr('transform', e.transform))
+  );
+
+  sim = d3.forceSimulation(nodes)
+    .force('link', d3.forceLink(linkData).id(d => d.id).distance(90))
+    .force('charge', d3.forceManyBody().strength(-180))
+    .force('center', d3.forceCenter(W/2, H/2))
+    .force('collide', d3.forceCollide(28));
+
+  link = root.append('g').selectAll('line').data(linkData).join('line')
+    .attr('class', 'link')
+    .attr('stroke-width', 1.5)
+    .attr('marker-end', 'url(#arrow)');
+
+  /* Arrowhead */
+  d3.select('#svg').append('defs').append('marker')
+    .attr('id', 'arrow').attr('viewBox', '0 -5 10 10')
+    .attr('refX', 20).attr('markerWidth', 6).attr('markerHeight', 6)
+    .attr('orient', 'auto')
+    .append('path').attr('d', 'M0,-5L10,0L0,5').attr('fill', '#8b949e');
+
+  node = root.append('g').selectAll('g').data(nodes).join('g')
+    .attr('class', 'node')
+    .call(d3.drag()
+      .on('start', (e,d) => { if(!e.active) sim.alphaTarget(0.3).restart(); d.fx=d.x; d.fy=d.y; })
+      .on('drag',  (e,d) => { d.fx=e.x; d.fy=e.y; })
+      .on('end',   (e,d) => { if(!e.active) sim.alphaTarget(0); d.fx=null; d.fy=null; })
+    )
+    .on('mousemove', (e, d) => {
+      tip.style.display = 'block';
+      tip.style.left = (e.pageX+12)+'px';
+      tip.style.top  = (e.pageY-10)+'px';
+      tip.innerHTML = `<b>${d.label}</b> [${d.type}]<br>uuid: ${d.id}<br>TV: (${d.s.toFixed(3)}, ${d.c.toFixed(3)})<br>STI: ${d.sti.toFixed(3)}`;
+    })
+    .on('mouseleave', () => { tip.style.display = 'none'; });
+
+  node.append('circle')
+    .attr('r', d => 8 + 12 * d.s)
+    .attr('fill', d => typeColor(d.type))
+    .attr('stroke', d => d3.color(typeColor(d.type)).darker(1));
+
+  node.append('text').attr('dy', '0.35em').attr('dx', 14)
+    .text(d => d.label.length > 16 ? d.label.slice(0,14)+'…' : d.label);
+
+  sim.on('tick', () => {
+    link.attr('x1', d => d.source.x).attr('y1', d => d.source.y)
+        .attr('x2', d => d.target.x).attr('y2', d => d.target.y);
+    node.attr('transform', d => `translate(${d.x},${d.y})`);
+  });
+}
+
+/* ── Demo data (offline) ─────────────────────────────────────────────────── */
+function loadDemo() {
+  const nodes = [
+    { id: 1, label: 'cat',         type: 'ConceptNode',     s: 0.8, c: 0.9, sti: 0.72 },
+    { id: 2, label: 'animal',      type: 'ConceptNode',     s: 0.5, c: 0.6, sti: 0.30 },
+    { id: 3, label: 'cat→animal',  type: 'ImplicationLink', s: 0.95,c: 0.8, sti: 0.50 },
+    { id: 4, label: 'mammal',      type: 'ConceptNode',     s: 0.7, c: 0.8, sti: 0.40 },
+    { id: 5, label: 'alive',       type: 'PredicateNode',   s: 0.9, c: 0.95,sti: 0.60 },
+  ];
+  const links = [
+    { source: 1, target: 3 }, { source: 3, target: 2 },
+    { source: 4, target: 2 }, { source: 1, target: 5 },
+  ];
+  render({ nodes, links });
+  setStatus('offline demo');
+}
+
+loadDemo();
+document.getElementById('poll').addEventListener('change', startPoll);
+</script>
+</body>
+</html>

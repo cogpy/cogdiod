@@ -20,6 +20,7 @@
 #include <unistd.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <netinet/in.h>
 #include <errno.h>
 
 /* ── Atom store ─────────────────────────────────────────────────────────── */
@@ -29,6 +30,7 @@
 #define NAME_LEN    64
 #define TYPE_LEN    32
 #define BUF_SIZE    65536
+#define TV_HIST_MAX 8
 
 typedef struct {
     uint64_t uuid;
@@ -37,9 +39,14 @@ typedef struct {
     float    strength;
     float    confidence;
     float    sti;
+    float    lti;
     uint64_t out_links[MAX_LINKS];
     int      out_count;
     int      alive;
+    /* episodic TV history */
+    float    tv_hist_s[TV_HIST_MAX];
+    float    tv_hist_c[TV_HIST_MAX];
+    int      hist_count;
 } Atom;
 
 static Atom      atoms[MAX_ATOMS];
@@ -63,7 +70,21 @@ static Atom* alloc_atom(void) {
     a->strength   = 0.5f;
     a->confidence = 0.1f;
     a->sti        = 0.0f;
+    a->lti        = 0.0f;
     return a;
+}
+
+static void push_history(Atom* a) {
+    if (a->hist_count < TV_HIST_MAX) {
+        a->tv_hist_s[a->hist_count] = a->strength;
+        a->tv_hist_c[a->hist_count] = a->confidence;
+        a->hist_count++;
+    } else {
+        memmove(a->tv_hist_s, a->tv_hist_s + 1, (TV_HIST_MAX-1)*sizeof(float));
+        memmove(a->tv_hist_c, a->tv_hist_c + 1, (TV_HIST_MAX-1)*sizeof(float));
+        a->tv_hist_s[TV_HIST_MAX-1] = a->strength;
+        a->tv_hist_c[TV_HIST_MAX-1] = a->confidence;
+    }
 }
 
 /* ── JSON helpers (minimal, no external lib) ─────────────────────────────── */
@@ -135,6 +156,7 @@ static void handle(const char* req, char* resp, size_t resp_sz) {
         uint64_t uuid = json_u64(req, "uuid");
         Atom* a = find_atom(uuid);
         if (!a) { snprintf(resp, resp_sz, "{\"error\":\"not_found\"}"); goto done; }
+        push_history(a);
         float s = json_float(req, "strength");
         float c = json_float(req, "confidence");
         if (s >= 0) a->strength = s;
@@ -156,14 +178,20 @@ static void handle(const char* req, char* resp, size_t resp_sz) {
         Atom* a = find_atom(uuid);
         if (!a) { snprintf(resp, resp_sz, "{\"uuids\":[]}"); goto done; }
         char* p = resp;
-        p += snprintf(p, resp_sz, "{\"uuids\":[");
+        size_t used = (size_t)snprintf(p, resp_sz, "{\"uuids\":[");
+        if (used < resp_sz) p += used;
         for (int i = 0; i < a->out_count; i++) {
-            if (i) p += snprintf(p, resp_sz - (p-resp), ",");
-            p += snprintf(p, resp_sz - (p-resp), "%llu",
-                          (unsigned long long)a->out_links[i]);
+            size_t rem = (p > resp + resp_sz) ? 0 : (size_t)(resp + resp_sz - p);
+            if (rem == 0) break;
+            if (i) { int w = snprintf(p, rem, ","); if (w > 0 && (size_t)w < rem) p += w; }
+            rem = (p > resp + resp_sz) ? 0 : (size_t)(resp + resp_sz - p);
+            if (rem > 0) {
+                int w = snprintf(p, rem, "%llu", (unsigned long long)a->out_links[i]);
+                if (w > 0 && (size_t)w < rem) p += w;
+            }
         }
-        snprintf(p, resp_sz - (p-resp), "]}");
-
+        { size_t rem = (p > resp + resp_sz) ? 0 : (size_t)(resp + resp_sz - p);
+          if (rem > 0) snprintf(p, rem, "]}"); }
     } else if (strcmp(op, "get_sti") == 0) {
         uint64_t uuid = json_u64(req, "uuid");
         Atom* a = find_atom(uuid);
@@ -180,20 +208,31 @@ static void handle(const char* req, char* resp, size_t resp_sz) {
 
     } else if (strcmp(op, "snapshot") == 0) {
         char* p = resp;
-        p += snprintf(p, resp_sz, "{\"atoms\":[");
+        size_t used = (size_t)snprintf(p, resp_sz, "{\"atoms\":[");
+        if (used < resp_sz) p += used;
         int first = 1;
         for (int i = 0; i < atom_count; i++) {
             if (!atoms[i].alive) continue;
-            if (!first) p += snprintf(p, resp_sz-(p-resp), ",");
+            size_t rem = (p >= resp + resp_sz) ? 0 : (size_t)(resp + resp_sz - p);
+            if (rem < 4) break;
+            if (!first) {
+                int w = snprintf(p, rem, ",");
+                if (w > 0 && (size_t)w < rem) p += w;
+            }
             first = 0;
-            p += snprintf(p, resp_sz-(p-resp),
-                "{\"uuid\":%llu,\"type\":\"%s\",\"name\":\"%s\","
-                "\"strength\":%.4f,\"confidence\":%.4f,\"sti\":%.4f}",
-                (unsigned long long)atoms[i].uuid,
-                atoms[i].type, atoms[i].name,
-                atoms[i].strength, atoms[i].confidence, atoms[i].sti);
+            rem = (p >= resp + resp_sz) ? 0 : (size_t)(resp + resp_sz - p);
+            if (rem > 0) {
+                int w = snprintf(p, rem,
+                    "{\"uuid\":%llu,\"type\":\"%s\",\"name\":\"%s\","
+                    "\"strength\":%.4f,\"confidence\":%.4f,\"sti\":%.4f}",
+                    (unsigned long long)atoms[i].uuid,
+                    atoms[i].type, atoms[i].name,
+                    atoms[i].strength, atoms[i].confidence, atoms[i].sti);
+                if (w > 0 && (size_t)w < rem) p += w;
+            }
         }
-        snprintf(p, resp_sz-(p-resp), "]}");
+        { size_t rem = (p >= resp + resp_sz) ? 0 : (size_t)(resp + resp_sz - p);
+          if (rem > 0) snprintf(p, rem, "]}"); }
 
     } else if (strcmp(op, "stats") == 0) {
         float total_sti = 0;
@@ -224,6 +263,76 @@ static void handle(const char* req, char* resp, size_t resp_sz) {
             }
         }
         snprintf(resp, resp_sz, "{\"ok\":true,\"applied\":%d}", applied);
+
+    } else if (strcmp(op, "unlink") == 0) {
+        uint64_t from = json_u64(req, "from");
+        uint64_t to   = json_u64(req, "to");
+        Atom* a = find_atom(from);
+        if (!a) { snprintf(resp, resp_sz, "{\"error\":\"not_found\"}"); goto done; }
+        int removed = 0;
+        for (int i = 0; i < a->out_count; i++) {
+            if (a->out_links[i] == to) {
+                memmove(&a->out_links[i], &a->out_links[i+1],
+                        (a->out_count - i - 1) * sizeof(uint64_t));
+                a->out_count--;
+                removed = 1;
+                break;
+            }
+        }
+        snprintf(resp, resp_sz, "{\"ok\":%s}", removed ? "true" : "false");
+
+    } else if (strcmp(op, "destroy") == 0) {
+        uint64_t uuid = json_u64(req, "uuid");
+        Atom* a = find_atom(uuid);
+        if (!a) { snprintf(resp, resp_sz, "{\"error\":\"not_found\"}"); goto done; }
+        a->alive = 0;
+        snprintf(resp, resp_sz, "{\"ok\":true}");
+
+    } else if (strcmp(op, "pln_deduce") == 0) {
+        /* P(C|A) given P(B|A) and P(C|B) via modus ponens */
+        uint64_t a_uuid    = json_u64(req, "antecedent");
+        uint64_t impl_uuid = json_u64(req, "implication");
+        Atom* ant  = find_atom(a_uuid);
+        Atom* impl = find_atom(impl_uuid);
+        if (!ant || !impl) {
+            snprintf(resp, resp_sz, "{\"error\":\"not_found\"}"); goto done;
+        }
+        float s = ant->strength * impl->strength;
+        float c = ant->confidence * impl->confidence * 0.9f;
+        snprintf(resp, resp_sz,
+                 "{\"strength\":%.4f,\"confidence\":%.4f}", s, c);
+
+    } else if (strcmp(op, "pln_revise") == 0) {
+        /* Bayesian revision of two truth-value estimates */
+        float s1 = json_float(req, "s1"), c1 = json_float(req, "c1");
+        float s2 = json_float(req, "s2"), c2 = json_float(req, "c2");
+        float k  = 1.0f;
+        float cn = c1 + c2;
+        float sn = (cn > 0) ? (s1*c1 + s2*c2) / cn : 0.0f;
+        float cc = cn / (cn + k);
+        snprintf(resp, resp_sz,
+                 "{\"strength\":%.4f,\"confidence\":%.4f}", sn, cc);
+
+    } else if (strcmp(op, "episodic") == 0) {
+        uint64_t uuid = json_u64(req, "uuid");
+        Atom* a = find_atom(uuid);
+        if (!a) { snprintf(resp, resp_sz, "{\"error\":\"not_found\"}"); goto done; }
+        char* p = resp;
+        size_t used = (size_t)snprintf(p, resp_sz, "{\"history\":[");
+        if (used < resp_sz) p += used;
+        for (int i = 0; i < a->hist_count; i++) {
+            size_t rem = (p >= resp + resp_sz) ? 0 : (size_t)(resp + resp_sz - p);
+            if (rem < 4) break;
+            if (i) { int w = snprintf(p, rem, ","); if (w > 0 && (size_t)w < rem) p += w; }
+            rem = (p >= resp + resp_sz) ? 0 : (size_t)(resp + resp_sz - p);
+            if (rem > 0) {
+                int w = snprintf(p, rem, "{\"s\":%.4f,\"c\":%.4f}",
+                                 a->tv_hist_s[i], a->tv_hist_c[i]);
+                if (w > 0 && (size_t)w < rem) p += w;
+            }
+        }
+        { size_t rem = (p >= resp + resp_sz) ? 0 : (size_t)(resp + resp_sz - p);
+          if (rem > 0) snprintf(p, rem, "]}"); }
 
     } else {
         snprintf(resp, resp_sz, "{\"error\":\"unknown_op\",\"op\":\"%s\"}", op);
@@ -258,6 +367,22 @@ static void* client_thread(void* arg) {
     return NULL;
 }
 
+/* ── TCP listener thread (port 19999) ────────────────────────────────────── */
+
+static void* tcp_accept_thread(void* arg) {
+    int srv = *(int*)arg;
+    free(arg);
+    for (;;) {
+        int* cfd = malloc(sizeof(int));
+        *cfd = accept(srv, NULL, NULL);
+        if (*cfd < 0) { free(cfd); break; }
+        pthread_t t;
+        pthread_create(&t, NULL, client_thread, cfd);
+        pthread_detach(t);
+    }
+    return NULL;
+}
+
 /* ── Main ────────────────────────────────────────────────────────────────── */
 
 int main(void) {
@@ -270,7 +395,27 @@ int main(void) {
         perror("bind"); return 1;
     }
     listen(srv, 16);
-    fprintf(stderr, "[cogdiod_bridge] listening on %s\n", BRIDGE_SOCK_PATH);
+    fprintf(stderr, "[cogdiod_bridge] UNIX socket: %s\n", BRIDGE_SOCK_PATH);
+
+    /* Also listen on TCP port 19999 */
+    int tcp_srv = socket(AF_INET, SOCK_STREAM, 0);
+    if (tcp_srv >= 0) {
+        int opt = 1;
+        setsockopt(tcp_srv, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+        struct sockaddr_in taddr = {0};
+        taddr.sin_family      = AF_INET;
+        taddr.sin_port        = htons(19999);
+        taddr.sin_addr.s_addr = INADDR_ANY;
+        if (bind(tcp_srv, (struct sockaddr*)&taddr, sizeof(taddr)) == 0) {
+            listen(tcp_srv, 16);
+            fprintf(stderr, "[cogdiod_bridge] TCP port 19999\n");
+            int* sp = malloc(sizeof(int));
+            *sp = tcp_srv;
+            pthread_t tt;
+            pthread_create(&tt, NULL, tcp_accept_thread, sp);
+            pthread_detach(tt);
+        }
+    }
 
     for (;;) {
         int* cfd = malloc(sizeof(int));

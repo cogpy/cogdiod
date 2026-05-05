@@ -39,6 +39,15 @@
 #include <fcntl.h>
 #include <errno.h>
 
+/* Safe append: advance n by snprintf result, clamped to rem */
+#define SNPRINTF_SAFE(buf, n, rem, ...) \
+    do { \
+        if ((n) < (rem)) { \
+            int _w = snprintf((buf)+(n), (rem)-(n), __VA_ARGS__); \
+            if (_w > 0) (n) += (size_t)(_w < (int)((rem)-(n)) ? _w : (int)((rem)-(n))); \
+        } \
+    } while(0)
+
 /* ─────────────────────────────────────────────────────────────────────────
  * 9P message types (subset of 9P2000.L used by DisTyx)
  * ───────────────────────────────────────────────────────────────────────── */
@@ -265,6 +274,29 @@ int distyx_dispatch(CogDiodKernel* k,
     /* /ai/atoms/... */
     if (p.depth >= 2 && strcmp(p.segment[1], "atoms") == 0) {
 
+        /* READ /ai/atoms/  — list all live atom UUIDs as JSON array */
+        if (req->op == DT_OP_READ && p.depth == 2) {
+            char* buf = (char*)resp->buf;
+            size_t rem = sizeof(resp->buf) - 1;
+            size_t n = 0;
+            SNPRINTF_SAFE(buf, n, rem, "[");
+            int first = 1;
+            pthread_rwlock_rdlock(&k->pool_lock);
+            for (int i = 0; i < ATOM_POOL_BUCKETS && n + 32 < rem; i++) {
+                AtomIsolate* a = k->atom_pool[i];
+                while (a && n + 32 < rem) {
+                    if (!first) SNPRINTF_SAFE(buf, n, rem, ",");
+                    SNPRINTF_SAFE(buf, n, rem, "%llu", (unsigned long long)a->uuid);
+                    first = 0;
+                    a = a->ht_next;
+                }
+            }
+            pthread_rwlock_unlock(&k->pool_lock);
+            SNPRINTF_SAFE(buf, n, rem, "]");
+            resp->buf_len = n;
+            return 0;
+        }
+
         /* CREATE: /ai/atoms/<type>/<name>  (Tlcreate) */
         if (req->op == DT_OP_CREATE && p.depth == 4) {
             uint64_t uuid = 0;
@@ -281,12 +313,76 @@ int distyx_dispatch(CogDiodKernel* k,
             return 0;
         }
 
+        /* STAT /ai/atoms/<uuid>  — JSON with type, name, tv, av */
+        if (req->op == DT_OP_STAT && p.depth == 3) {
+            uint64_t uuid = strtoull(p.segment[2], NULL, 10);
+            AtomIsolate* a = cogdiod_get_atom(k, uuid);
+            if (!a) { resp->status = -1; return -1; }
+            resp->buf_len = (size_t)snprintf((char*)resp->buf,
+                sizeof(resp->buf),
+                "{\"uuid\":%llu,\"type_id\":%u,\"name\":\"%s\","
+                "\"tv\":{\"s\":%.4f,\"c\":%.4f},"
+                "\"av\":{\"sti\":%.4f,\"lti\":%.4f}}",
+                (unsigned long long)a->uuid, a->type_id, a->name,
+                a->tv.strength, a->tv.confidence,
+                a->av.sti, a->av.lti);
+            return 0;
+        }
+
         /* READ /ai/atoms/<uuid>/tv */
         if (req->op == DT_OP_READ && p.depth == 4
             && strcmp(p.segment[3], "tv") == 0) {
             uint64_t uuid = strtoull(p.segment[2], NULL, 10);
             return distyx_handle_read_tv(k, uuid,
                                          resp->buf, &resp->buf_len);
+        }
+
+        /* READ /ai/atoms/<uuid>/lti  — 4 bytes (float LTI) */
+        if (req->op == DT_OP_READ && p.depth == 4
+            && strcmp(p.segment[3], "lti") == 0) {
+            uint64_t uuid = strtoull(p.segment[2], NULL, 10);
+            AtomIsolate* a = cogdiod_get_atom(k, uuid);
+            if (!a) { resp->status = -1; return -1; }
+            memcpy(resp->buf, &a->av.lti, 4);
+            resp->buf_len = 4;
+            return 0;
+        }
+
+        /* READ /ai/atoms/<uuid>/type  — type name string */
+        if (req->op == DT_OP_READ && p.depth == 4
+            && strcmp(p.segment[3], "type") == 0) {
+            uint64_t uuid = strtoull(p.segment[2], NULL, 10);
+            AtomIsolate* a = cogdiod_get_atom(k, uuid);
+            if (!a) { resp->status = -1; return -1; }
+            const char* tname = a->package ? a->package->name : "unknown";
+            resp->buf_len = strlen(tname);
+            memcpy(resp->buf, tname, resp->buf_len);
+            return 0;
+        }
+
+        /* READ /ai/atoms/<uuid>/links  — JSON array of outgoing UUIDs */
+        if (req->op == DT_OP_READ && p.depth == 4
+            && strcmp(p.segment[3], "links") == 0) {
+            uint64_t uuid = strtoull(p.segment[2], NULL, 10);
+            AtomIsolate* a = cogdiod_get_atom(k, uuid);
+            if (!a) { resp->status = -1; return -1; }
+            char* buf = (char*)resp->buf;
+            size_t rem = sizeof(resp->buf) - 1;
+            size_t n = 0;
+            SNPRINTF_SAFE(buf, n, rem, "[");
+            int first = 1;
+            pthread_mutex_lock(&a->lock);
+            LimboChannel* ch = a->outgoing;
+            while (ch && n + 32 < rem) {
+                if (!first) SNPRINTF_SAFE(buf, n, rem, ",");
+                SNPRINTF_SAFE(buf, n, rem, "%llu", (unsigned long long)ch->dst_uuid);
+                first = 0;
+                ch = ch->out_next;
+            }
+            pthread_mutex_unlock(&a->lock);
+            SNPRINTF_SAFE(buf, n, rem, "]");
+            resp->buf_len = n;
+            return 0;
         }
 
         /* WRITE /ai/atoms/<uuid>/tv */
@@ -332,3 +428,125 @@ int distyx_dispatch(CogDiodKernel* k,
     resp->status = -1;
     return -1;
 }
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * TCP line-protocol server
+ *
+ * Accepts connections on the given port. Each line is a request of form:
+ *   OP PATH [DATA_HEX]\n
+ * where OP is one of: READ WRITE CREATE STAT LINK REMOVE
+ * ───────────────────────────────────────────────────────────────────────── */
+
+typedef struct {
+    CogDiodKernel* k;
+    int            fd;
+} TcpClientArg;
+
+static void* tcp_client_thread(void* arg) {
+    TcpClientArg* ca = (TcpClientArg*)arg;
+    CogDiodKernel* k = ca->k;
+    int fd = ca->fd;
+    free(ca);
+
+    char line[1024];
+    int n;
+    while ((n = recv(fd, line, sizeof(line) - 1, 0)) > 0) {
+        line[n] = '\0';
+        char* nl = strchr(line, '\n');
+        if (nl) *nl = '\0';
+        if (!line[0]) continue;
+
+        /* Parse: OP PATH */
+        char op_str[16] = {0};
+        char path[512] = {0};
+        sscanf(line, "%15s %511s", op_str, path);
+
+        DisTyxRequest req = {0};
+        DisTyxResponse resp = {0};
+        strncpy(req.path, path, sizeof(req.path) - 1);
+
+        if      (strcmp(op_str, "READ")   == 0) req.op = DT_OP_READ;
+        else if (strcmp(op_str, "WRITE")  == 0) req.op = DT_OP_WRITE;
+        else if (strcmp(op_str, "CREATE") == 0) req.op = DT_OP_CREATE;
+        else if (strcmp(op_str, "STAT")   == 0) req.op = DT_OP_STAT;
+        else if (strcmp(op_str, "LINK")   == 0) req.op = DT_OP_LINK;
+        else if (strcmp(op_str, "REMOVE") == 0) req.op = DT_OP_REMOVE;
+
+        distyx_dispatch(k, &req, &resp);
+
+        char out[DISTYX_MSIZE + 64];
+        int olen;
+        if (resp.status == 0 && resp.buf_len > 0) {
+            olen = snprintf(out, sizeof(out), "OK %.*s\n",
+                            (int)resp.buf_len, (char*)resp.buf);
+        } else if (resp.status == 0) {
+            olen = snprintf(out, sizeof(out), "OK\n");
+        } else {
+            olen = snprintf(out, sizeof(out), "ERR %s\n", resp.errmsg);
+        }
+        send(fd, out, olen, 0);
+    }
+    close(fd);
+    return NULL;
+}
+
+typedef struct {
+    CogDiodKernel* k;
+    int            srv_fd;
+} TcpServerArg;
+
+static void* tcp_server_thread(void* arg) {
+    TcpServerArg* sa = (TcpServerArg*)arg;
+    CogDiodKernel* k = sa->k;
+    int srv = sa->srv_fd;
+    free(sa);
+
+    while (k->running) {
+        struct sockaddr_in peer;
+        socklen_t plen = sizeof(peer);
+        int cfd = accept(srv, (struct sockaddr*)&peer, &plen);
+        if (cfd < 0) {
+            if (k->running) perror("[distyx_tcp] accept");
+            break;
+        }
+        TcpClientArg* ca = malloc(sizeof(TcpClientArg));
+        ca->k  = k;
+        ca->fd = cfd;
+        pthread_t t;
+        pthread_create(&t, NULL, tcp_client_thread, ca);
+        pthread_detach(t);
+    }
+    close(srv);
+    return NULL;
+}
+
+int distyx_start_tcp(CogDiodKernel* k, uint16_t port) {
+    int srv = socket(AF_INET, SOCK_STREAM, 0);
+    if (srv < 0) return -1;
+
+    int opt = 1;
+    setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    struct sockaddr_in addr = {0};
+    addr.sin_family      = AF_INET;
+    addr.sin_port        = htons(port);
+    addr.sin_addr.s_addr = INADDR_ANY;
+
+    if (bind(srv, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        close(srv);
+        return -1;
+    }
+    listen(srv, 16);
+
+    TcpServerArg* sa = malloc(sizeof(TcpServerArg));
+    sa->k      = k;
+    sa->srv_fd = srv;
+
+    pthread_t t;
+    pthread_create(&t, NULL, tcp_server_thread, sa);
+    pthread_detach(t);
+
+    fprintf(stderr, "[distyx] TCP server listening on port %u\n", port);
+    return 0;
+}
+
