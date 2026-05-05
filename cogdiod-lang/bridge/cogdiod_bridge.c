@@ -1,111 +1,3 @@
-/*
- * cogdiod_bridge.c — Minimal CogDiod bridge server
- *
- * Listens on a UNIX-domain socket at /tmp/cogdiod.sock.
- * Speaks newline-delimited JSON.  Each language integration connects
- * as a client and uses this server as its AtomSpace.
- *
- * Build:  zig cc -O2 -std=c11 -o cogdiod_bridge cogdiod_bridge.c -lm
- * Run:    ./cogdiod_bridge &
- */
-
-#define _GNU_SOURCE
-#define BRIDGE_SOCK_PATH "/tmp/cogdiod.sock"
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <stdint.h>
-#include <math.h>
-#include <pthread.h>
-#include <unistd.h>
-#include <sys/socket.h>
-#include <sys/un.h>
-#include <errno.h>
-
-/* ── Atom store ─────────────────────────────────────────────────────────── */
-
-#define MAX_ATOMS   4096
-#define MAX_LINKS   16
-#define NAME_LEN    64
-#define TYPE_LEN    32
-#define BUF_SIZE    65536
-
-typedef struct {
-    uint64_t uuid;
-    char     type[TYPE_LEN];
-    char     name[NAME_LEN];
-    float    strength;
-    float    confidence;
-    float    sti;
-    uint64_t out_links[MAX_LINKS];
-    int      out_count;
-    int      alive;
-} Atom;
-
-static Atom      atoms[MAX_ATOMS];
-static int       atom_count = 0;
-static uint64_t  next_uuid  = 1;
-static pthread_mutex_t store_lock = PTHREAD_MUTEX_INITIALIZER;
-
-/* ── Helpers ─────────────────────────────────────────────────────────────── */
-
-static Atom* find_atom(uint64_t uuid) {
-    for (int i = 0; i < atom_count; i++)
-        if (atoms[i].alive && atoms[i].uuid == uuid) return &atoms[i];
-    return NULL;
-}
-
-static Atom* alloc_atom(void) {
-    if (atom_count >= MAX_ATOMS) return NULL;
-    Atom* a = &atoms[atom_count++];
-    memset(a, 0, sizeof(*a));
-    a->alive      = 1;
-    a->strength   = 0.5f;
-    a->confidence = 0.1f;
-    a->sti        = 0.0f;
-    return a;
-}
-
-/* ── JSON helpers (minimal, no external lib) ─────────────────────────────── */
-
-static float json_float(const char* buf, const char* key) {
-    char search[64];
-    snprintf(search, sizeof(search), "\"%s\":", key);
-    const char* p = strstr(buf, search);
-    if (!p) return 0.0f;
-    p += strlen(search);
-    while (*p == ' ') p++;
-    return (float)atof(p);
-}
-
-static uint64_t json_u64(const char* buf, const char* key) {
-    char search[64];
-    snprintf(search, sizeof(search), "\"%s\":", key);
-    const char* p = strstr(buf, search);
-    if (!p) return 0;
-    p += strlen(search);
-    while (*p == ' ') p++;
-    return (uint64_t)strtoull(p, NULL, 10);
-}
-
-static void json_str(const char* buf, const char* key, char* out, size_t n) {
-    char search[64];
-    snprintf(search, sizeof(search), "\"%s\":", key);
-    const char* p = strstr(buf, search);
-    if (!p) { out[0] = '\0'; return; }
-    p += strlen(search);
-    while (*p == ' ' || *p == '"') p++;
-    size_t i = 0;
-    while (*p && *p != '"' && i < n-1) out[i++] = *p++;
-    out[i] = '\0';
-}
-
-static const char* json_op(const char* buf) {
-    static char op[32];
-    json_str(buf, "op", op, sizeof(op));
-    return op;
-}
-
 /* ── Request handler ─────────────────────────────────────────────────────── */
 
 static void handle(const char* req, char* resp, size_t resp_sz) {
@@ -122,6 +14,7 @@ static void handle(const char* req, char* resp, size_t resp_sz) {
         float c = json_float(req, "confidence");
         if (s > 0) a->strength = s;
         if (c > 0) a->confidence = c;
+        push_history(a);
         snprintf(resp, resp_sz, "{\"uuid\":%llu}", (unsigned long long)a->uuid);
 
     } else if (strcmp(op, "get_tv") == 0) {
@@ -135,6 +28,7 @@ static void handle(const char* req, char* resp, size_t resp_sz) {
         uint64_t uuid = json_u64(req, "uuid");
         Atom* a = find_atom(uuid);
         if (!a) { snprintf(resp, resp_sz, "{\"error\":\"not_found\"}"); goto done; }
+        push_history(a);   /* save current TV before overwriting */
         float s = json_float(req, "strength");
         float c = json_float(req, "confidence");
         if (s >= 0) a->strength = s;
@@ -151,6 +45,31 @@ static void handle(const char* req, char* resp, size_t resp_sz) {
         a->out_links[a->out_count++] = to;
         snprintf(resp, resp_sz, "{\"ok\":true}");
 
+    } else if (strcmp(op, "unlink") == 0) {
+        uint64_t from = json_u64(req, "from");
+        uint64_t to   = json_u64(req, "to");
+        Atom* a = find_atom(from);
+        if (!a) { snprintf(resp, resp_sz, "{\"error\":\"not_found\"}"); goto done; }
+        int removed = 0;
+        for (int i = 0; i < a->out_count; i++) {
+            if (a->out_links[i] == to) {
+                /* Shift remaining links left */
+                for (int j = i; j < a->out_count - 1; j++)
+                    a->out_links[j] = a->out_links[j+1];
+                a->out_count--;
+                removed = 1;
+                break;
+            }
+        }
+        snprintf(resp, resp_sz, "{\"ok\":%s}", removed ? "true" : "false");
+
+    } else if (strcmp(op, "destroy") == 0) {
+        uint64_t uuid = json_u64(req, "uuid");
+        Atom* a = find_atom(uuid);
+        if (!a) { snprintf(resp, resp_sz, "{\"error\":\"not_found\"}"); goto done; }
+        a->alive = 0;
+        snprintf(resp, resp_sz, "{\"ok\":true}");
+
     } else if (strcmp(op, "get_links") == 0) {
         uint64_t uuid = json_u64(req, "uuid");
         Atom* a = find_atom(uuid);
@@ -158,11 +77,11 @@ static void handle(const char* req, char* resp, size_t resp_sz) {
         char* p = resp;
         p += snprintf(p, resp_sz, "{\"uuids\":[");
         for (int i = 0; i < a->out_count; i++) {
-            if (i) p += snprintf(p, resp_sz - (p-resp), ",");
-            p += snprintf(p, resp_sz - (p-resp), "%llu",
+            if (i) p += snprintf(p, resp_sz - (size_t)(p-resp), ",");
+            p += snprintf(p, resp_sz - (size_t)(p-resp), "%llu",
                           (unsigned long long)a->out_links[i]);
         }
-        snprintf(p, resp_sz - (p-resp), "]}");
+        snprintf(p, resp_sz - (size_t)(p-resp), "]}");
 
     } else if (strcmp(op, "get_sti") == 0) {
         uint64_t uuid = json_u64(req, "uuid");
@@ -184,42 +103,105 @@ static void handle(const char* req, char* resp, size_t resp_sz) {
         int first = 1;
         for (int i = 0; i < atom_count; i++) {
             if (!atoms[i].alive) continue;
-            if (!first) p += snprintf(p, resp_sz-(p-resp), ",");
+            if (!first) p += snprintf(p, resp_sz-(size_t)(p-resp), ",");
             first = 0;
-            p += snprintf(p, resp_sz-(p-resp),
+            p += snprintf(p, resp_sz-(size_t)(p-resp),
                 "{\"uuid\":%llu,\"type\":\"%s\",\"name\":\"%s\","
                 "\"strength\":%.4f,\"confidence\":%.4f,\"sti\":%.4f}",
                 (unsigned long long)atoms[i].uuid,
                 atoms[i].type, atoms[i].name,
                 atoms[i].strength, atoms[i].confidence, atoms[i].sti);
         }
-        snprintf(p, resp_sz-(p-resp), "]}");
+        snprintf(p, resp_sz-(size_t)(p-resp), "]}");
 
     } else if (strcmp(op, "stats") == 0) {
         float total_sti = 0;
-        for (int i = 0; i < atom_count; i++)
-            if (atoms[i].alive) total_sti += atoms[i].sti;
+        int   live = 0;
+        for (int i = 0; i < atom_count; i++) {
+            if (!atoms[i].alive) continue;
+            total_sti += atoms[i].sti;
+            live++;
+        }
         snprintf(resp, resp_sz,
                  "{\"atom_count\":%d,\"total_sti\":%.4f}",
-                 atom_count, total_sti);
+                 live, total_sti);
+
+    } else if (strcmp(op, "pln_deduce") == 0) {
+        /*
+         * {"op":"pln_deduce","ant_uuid":1,"impl_uuid":3}
+         * → deduces consequent TV from antecedent + implication TVs
+         */
+        uint64_t ant_uuid  = json_u64(req, "ant_uuid");
+        uint64_t impl_uuid = json_u64(req, "impl_uuid");
+        Atom* ant  = find_atom(ant_uuid);
+        Atom* impl = find_atom(impl_uuid);
+        if (!ant || !impl) {
+            snprintf(resp, resp_sz, "{\"error\":\"not_found\"}"); goto done;
+        }
+        float s_out, c_out;
+        pln_deduce_local(impl->strength, impl->confidence,
+                         ant->strength,  ant->confidence,
+                         &s_out, &c_out);
+        snprintf(resp, resp_sz,
+                 "{\"strength\":%.4f,\"confidence\":%.4f}", s_out, c_out);
+
+    } else if (strcmp(op, "pln_revise") == 0) {
+        /*
+         * {"op":"pln_revise","uuid":1,"strength2":0.9,"confidence2":0.8}
+         * → revises the atom's TV with a new observation
+         */
+        uint64_t uuid = json_u64(req, "uuid");
+        Atom* a = find_atom(uuid);
+        if (!a) { snprintf(resp, resp_sz, "{\"error\":\"not_found\"}"); goto done; }
+        float s2 = json_float(req, "strength2");
+        float c2 = json_float(req, "confidence2");
+        float s_out, c_out;
+        push_history(a);
+        pln_revise_local(a->strength, a->confidence, s2, c2, &s_out, &c_out);
+        a->strength   = s_out;
+        a->confidence = c_out;
+        snprintf(resp, resp_sz,
+                 "{\"ok\":true,\"strength\":%.4f,\"confidence\":%.4f}",
+                 s_out, c_out);
+
+    } else if (strcmp(op, "episodic") == 0) {
+        /*
+         * {"op":"episodic","uuid":1,"version":2}
+         * → returns the TV at version N (0=oldest, hist_count-1=newest before current)
+         */
+        uint64_t uuid    = json_u64(req, "uuid");
+        int      version = (int)json_u64(req, "version");
+        Atom* a = find_atom(uuid);
+        if (!a) { snprintf(resp, resp_sz, "{\"error\":\"not_found\"}"); goto done; }
+        if (a->hist_count == 0 || version < 0 || version >= a->hist_count) {
+            snprintf(resp, resp_sz, "{\"error\":\"no_history\"}"); goto done;
+        }
+        /* Map version to ring buffer index.
+         * version 0 = oldest = (hist_head - hist_count + TV_HIST_MAX) % TV_HIST_MAX
+         * version hist_count-1 = newest saved = (hist_head - 1 + TV_HIST_MAX) % TV_HIST_MAX
+         */
+        int idx = (a->hist_head - a->hist_count + version + TV_HIST_MAX * 2) % TV_HIST_MAX;
+        snprintf(resp, resp_sz,
+                 "{\"version\":%d,\"strength\":%.4f,\"confidence\":%.4f}",
+                 version, a->tv_hist_s[idx], a->tv_hist_c[idx]);
 
     } else if (strcmp(op, "rewrite_rule") == 0) {
-        /*
-         * Simplified rewrite: find all atoms whose type matches
-         * "from_pattern" and set their TV to the "to_pattern" TV.
-         * A real Maude-style rewriter would match term structure.
-         */
-        char from_type[TYPE_LEN], to_type[TYPE_LEN];
+        char from_type[TYPE_LEN];
         json_str(req, "from_type", from_type, TYPE_LEN);
-        json_str(req, "to_type",   to_type,   TYPE_LEN);
         float new_s = json_float(req, "new_strength");
         float new_c = json_float(req, "new_confidence");
+        float boost  = json_float(req, "boost");
         int applied = 0;
         for (int i = 0; i < atom_count; i++) {
             if (!atoms[i].alive) continue;
             if (strcmp(atoms[i].type, from_type) == 0) {
-                if (new_s > 0) atoms[i].strength   = new_s;
-                if (new_c > 0) atoms[i].confidence = new_c;
+                push_history(&atoms[i]);
+                if (boost > 0) {
+                    atoms[i].strength = fminf(1.0f, atoms[i].strength * boost);
+                } else {
+                    if (new_s > 0) atoms[i].strength   = new_s;
+                    if (new_c > 0) atoms[i].confidence = new_c;
+                }
                 applied++;
             }
         }
@@ -258,20 +240,61 @@ static void* client_thread(void* arg) {
     return NULL;
 }
 
+/* ── TCP accept thread (for Clojure and other JVM-based clients) ─────────── */
+
+static void* tcp_accept_thread(void* arg) {
+    int srv = *(int*)arg;
+    free(arg);
+    for (;;) {
+        int* cfd = malloc(sizeof(int));
+        *cfd = accept(srv, NULL, NULL);
+        if (*cfd < 0) { free(cfd); break; }
+        pthread_t t;
+        pthread_create(&t, NULL, client_thread, cfd);
+        pthread_detach(t);
+    }
+    return NULL;
+}
+
 /* ── Main ────────────────────────────────────────────────────────────────── */
 
 int main(void) {
+    /* UNIX socket */
     unlink(BRIDGE_SOCK_PATH);
     int srv = socket(AF_UNIX, SOCK_STREAM, 0);
     struct sockaddr_un addr = {0};
     addr.sun_family = AF_UNIX;
     strncpy(addr.sun_path, BRIDGE_SOCK_PATH, sizeof(addr.sun_path)-1);
     if (bind(srv, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        perror("bind"); return 1;
+        perror("bind UNIX"); return 1;
     }
     listen(srv, 16);
-    fprintf(stderr, "[cogdiod_bridge] listening on %s\n", BRIDGE_SOCK_PATH);
+    fprintf(stderr, "[cogdiod_bridge] UNIX socket: %s\n", BRIDGE_SOCK_PATH);
 
+    /* TCP socket on port 19999 (for Clojure / JVM clients) */
+    int tcp_srv = socket(AF_INET, SOCK_STREAM, 0);
+    if (tcp_srv >= 0) {
+        int opt = 1;
+        setsockopt(tcp_srv, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+        struct sockaddr_in tcp_addr = {0};
+        tcp_addr.sin_family      = AF_INET;
+        tcp_addr.sin_port        = htons(19999);
+        tcp_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        if (bind(tcp_srv, (struct sockaddr*)&tcp_addr, sizeof(tcp_addr)) == 0) {
+            listen(tcp_srv, 16);
+            fprintf(stderr, "[cogdiod_bridge] TCP socket: 127.0.0.1:19999\n");
+            int* srv_ptr = malloc(sizeof(int));
+            *srv_ptr = tcp_srv;
+            pthread_t tcp_t;
+            pthread_create(&tcp_t, NULL, tcp_accept_thread, srv_ptr);
+            pthread_detach(tcp_t);
+        } else {
+            perror("bind TCP (non-fatal)");
+            close(tcp_srv);
+        }
+    }
+
+    /* UNIX accept loop (main thread) */
     for (;;) {
         int* cfd = malloc(sizeof(int));
         *cfd = accept(srv, NULL, NULL);
@@ -280,4 +303,3 @@ int main(void) {
         pthread_create(&t, NULL, client_thread, cfd);
         pthread_detach(t);
     }
-}

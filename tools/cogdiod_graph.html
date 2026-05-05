@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<!--
+  cogdiod_graph.html — CogDiod live AtomSpace graph visualizer
+  ============================================================
+  
+  Self-contained HTML/JS/CSS file. Uses D3.js (v7, loaded from CDN)
+  to render a force-directed graph of the live AtomSpace.
+
+  Usage:
+    1. Start the bridge server: ./cogdiod_bridge &
+    2. Open this file in a browser via a local server that can proxy
+       the bridge snapshot API, OR use the built-in HTTP endpoint
+       by loading this file through the bridge's HTTP server (port 8080).
+
+  The page polls the bridge snapshot endpoint every 2 seconds and
+  updates the graph:
+    - Nodes  = Atoms  (size ∝ TV strength, colour ∝ STI temperature)
+    - Edges  = LimboChannels (directed arrows)
+    - Labels = type(name) TV=(s,c)
+
+  Configuration:
+    POLL_URL  — URL of the snapshot JSON endpoint
+    POLL_MS   — polling interval in milliseconds
+-->
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>CogDiod AtomSpace Visualizer</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: 'Courier New', monospace;
+    background: #0d1117;
+    color: #c9d1d9;
+    overflow: hidden;
+  }
+  #header {
+    position: fixed; top: 0; left: 0; right: 0;
+    height: 40px;
+    background: #161b22;
+    border-bottom: 1px solid #30363d;
+    display: flex; align-items: center;
+    padding: 0 16px;
+    z-index: 100;
+    gap: 16px;
+  }
+  #header h1 { font-size: 14px; color: #58a6ff; }
+  #stats { font-size: 12px; color: #8b949e; }
+  #poll-indicator {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: #3fb950;
+    transition: background 0.2s;
+  }
+  #poll-indicator.stale { background: #da3633; }
+  #canvas { width: 100vw; height: 100vh; padding-top: 40px; }
+  svg { width: 100%; height: 100%; }
+
+  /* Node styles */
+  .node circle {
+    stroke: #30363d;
+    stroke-width: 1.5px;
+    cursor: grab;
+  }
+  .node circle:active { cursor: grabbing; }
+  .node text {
+    font-size: 10px;
+    fill: #c9d1d9;
+    pointer-events: none;
+    text-anchor: middle;
+    dominant-baseline: central;
+  }
+  .node .label-bg {
+    fill: rgba(13,17,23,0.8);
+  }
+
+  /* Edge styles */
+  .link line {
+    stroke: #30363d;
+    stroke-opacity: 0.7;
+  }
+  .link .arrow { fill: #30363d; }
+
+  /* Legend */
+  #legend {
+    position: fixed; bottom: 16px; right: 16px;
+    background: #161b22;
+    border: 1px solid #30363d;
+    border-radius: 6px;
+    padding: 12px;
+    font-size: 11px;
+  }
+  #legend h3 { font-size: 12px; margin-bottom: 8px; color: #58a6ff; }
+  .legend-item { display: flex; align-items: center; gap: 8px; margin: 4px 0; }
+  .legend-dot {
+    width: 12px; height: 12px; border-radius: 50%;
+    flex-shrink: 0;
+  }
+</style>
+</head>
+<body>
+
+<div id="header">
+  <div id="poll-indicator"></div>
+  <h1>CogDiod AtomSpace Visualizer</h1>
+  <div id="stats">Loading…</div>
+</div>
+
+<div id="canvas">
+  <svg id="graph">
+    <defs>
+      <marker id="arrowhead" markerWidth="8" markerHeight="6"
+              refX="8" refY="3" orient="auto">
+        <polygon points="0 0, 8 3, 0 6" class="arrow" fill="#58a6ff" opacity="0.7"/>
+      </marker>
+    </defs>
+    <g id="root"></g>
+  </svg>
+</div>
+
+<div id="legend">
+  <h3>Legend</h3>
+  <div class="legend-item">
+    <div class="legend-dot" style="background:#58a6ff"></div>
+    <span>ConceptNode</span>
+  </div>
+  <div class="legend-item">
+    <div class="legend-dot" style="background:#3fb950"></div>
+    <span>ImplicationLink</span>
+  </div>
+  <div class="legend-item">
+    <div class="legend-dot" style="background:#d29922"></div>
+    <span>EvaluationLink</span>
+  </div>
+  <div class="legend-item">
+    <div class="legend-dot" style="background:#bc8cff"></div>
+    <span>Other</span>
+  </div>
+  <hr style="border-color:#30363d;margin:8px 0">
+  <div style="color:#8b949e">
+    Node size = TV strength<br>
+    Node glow = STI (blue→red)<br>
+    Drag to reposition
+  </div>
+</div>
+
+<script src="https://d3js.org/d3.v7.min.js"></script>
+<script>
+/* ── Configuration ─────────────────────────────────────────────────── */
+const POLL_URL = 'http://localhost:8080/snapshot';
+const POLL_MS  = 2000;
+const FALLBACK_SNAPSHOT = null;  /* set to mock data for offline testing */
+
+/* ── Colour palette ────────────────────────────────────────────────── */
+const TYPE_COLORS = {
+  'ConceptNode':    '#58a6ff',
+  'ImplicationLink':'#3fb950',
+  'EvaluationLink': '#d29922',
+};
+function typeColor(t) { return TYPE_COLORS[t] || '#bc8cff'; }
+
+/* STI → glow colour (blue cold, red hot) */
+function stiGlow(sti) {
+  const t = Math.min(1.0, Math.max(0.0, sti / 10.0));
+  const r = Math.round(88  + t * (218 - 88));
+  const g = Math.round(166 + t * (54  - 166));
+  const b = Math.round(255 + t * (51  - 255));
+  return `rgb(${r},${g},${b})`;
+}
+
+/* ── D3 setup ──────────────────────────────────────────────────────── */
+const svg    = d3.select('#graph');
+const root   = d3.select('#root');
+const width  = window.innerWidth;
+const height = window.innerHeight - 40;
+
+/* Zoom + pan */
+svg.call(d3.zoom()
+  .scaleExtent([0.1, 8])
+  .on('zoom', e => root.attr('transform', e.transform)));
+
+/* Force simulation */
+const sim = d3.forceSimulation()
+  .force('link',   d3.forceLink().id(d => d.uuid).distance(80))
+  .force('charge', d3.forceManyBody().strength(-200))
+  .force('center', d3.forceCenter(width / 2, height / 2))
+  .force('collide', d3.forceCollide(30));
+
+let linkSel = root.append('g').attr('class','links').selectAll('.link');
+let nodeSel = root.append('g').attr('class','nodes').selectAll('.node');
+
+/* ── State ─────────────────────────────────────────────────────────── */
+let nodes = [];
+let links = [];
+let nodeMap = {};
+
+function mergeData(snapshot) {
+  const incoming = snapshot.atoms || [];
+  const newMap   = {};
+
+  /* Build link list from out_links in snapshot
+     (snapshot doesn't include links, so we rely on last known state
+     or a separate /links endpoint if available) */
+  const newNodes = incoming.map(a => {
+    const existing = nodeMap[a.uuid] || {};
+    return Object.assign({}, existing, {
+      uuid:       a.uuid,
+      type:       a.type,
+      name:       a.name,
+      strength:   a.strength,
+      confidence: a.confidence,
+      sti:        a.sti,
+    });
+  });
+
+  newNodes.forEach(n => newMap[n.uuid] = n);
+  nodeMap = newMap;
+  nodes   = newNodes;
+
+  /* Build links from out_links if present */
+  links = [];
+  incoming.forEach(a => {
+    if (a.links) {
+      a.links.forEach(dst => {
+        if (nodeMap[dst]) links.push({ source: a.uuid, target: dst });
+      });
+    }
+  });
+}
+
+function render() {
+  /* Links */
+  linkSel = root.select('.links').selectAll('.link').data(links, d => `${d.source}-${d.target}`);
+  linkSel.exit().remove();
+  const linkEnter = linkSel.enter().append('g').attr('class','link');
+  linkEnter.append('line')
+    .attr('stroke', '#58a6ff')
+    .attr('stroke-opacity', 0.5)
+    .attr('stroke-width', 1.5)
+    .attr('marker-end', 'url(#arrowhead)');
+  linkSel = linkEnter.merge(linkSel);
+
+  /* Nodes */
+  nodeSel = root.select('.nodes').selectAll('.node').data(nodes, d => d.uuid);
+  nodeSel.exit().remove();
+  const nodeEnter = nodeSel.enter().append('g').attr('class','node')
+    .call(d3.drag()
+      .on('start', (e,d) => { if (!e.active) sim.alphaTarget(0.3).restart(); d.fx=d.x; d.fy=d.y; })
+      .on('drag',  (e,d) => { d.fx=e.x; d.fy=e.y; })
+      .on('end',   (e,d) => { if (!e.active) sim.alphaTarget(0); d.fx=null; d.fy=null; }));
+
+  nodeEnter.append('circle');
+  nodeEnter.append('text').attr('dy', 24).attr('font-size', 9).attr('text-anchor','middle');
+  nodeEnter.append('title');
+
+  nodeSel = nodeEnter.merge(nodeSel);
+
+  /* Update circles */
+  nodeSel.select('circle')
+    .attr('r', d => 8 + d.strength * 16)
+    .attr('fill', d => typeColor(d.type))
+    .attr('stroke', d => stiGlow(d.sti))
+    .attr('stroke-width', d => 1.5 + Math.min(4, d.sti * 0.3));
+
+  /* Update labels */
+  nodeSel.select('text')
+    .text(d => `${d.type}(${d.name || d.uuid}) s=${d.strength.toFixed(2)}`);
+
+  /* Update tooltips */
+  nodeSel.select('title')
+    .text(d => `uuid:${d.uuid}  type:${d.type}  name:${d.name}\n` +
+               `TV=(${d.strength.toFixed(3)}, ${d.confidence.toFixed(3)})  STI=${d.sti.toFixed(2)}`);
+
+  /* Restart simulation */
+  sim.nodes(nodes);
+  sim.force('link').links(links);
+  sim.alpha(0.3).restart();
+}
+
+sim.on('tick', () => {
+  linkSel.select('line')
+    .attr('x1', d => d.source.x)
+    .attr('y1', d => d.source.y)
+    .attr('x2', d => {
+      const dx = d.target.x - d.source.x;
+      const dy = d.target.y - d.source.y;
+      const dist = Math.sqrt(dx*dx + dy*dy) || 1;
+      const r    = 8 + (d.target.strength||0.5) * 16 + 8;
+      return d.source.x + dx * (1 - r/dist);
+    })
+    .attr('y2', d => {
+      const dx = d.target.x - d.source.x;
+      const dy = d.target.y - d.source.y;
+      const dist = Math.sqrt(dx*dx + dy*dy) || 1;
+      const r    = 8 + (d.target.strength||0.5) * 16 + 8;
+      return d.source.y + dy * (1 - r/dist);
+    });
+
+  nodeSel.attr('transform', d => `translate(${d.x},${d.y})`);
+});
+
+/* ── Polling ────────────────────────────────────────────────────────── */
+const indicator = document.getElementById('poll-indicator');
+const statsEl   = document.getElementById('stats');
+
+function poll() {
+  fetch(POLL_URL)
+    .then(r => r.json())
+    .then(data => {
+      indicator.classList.remove('stale');
+      mergeData(data);
+      render();
+      const live = nodes.length;
+      const totalSTI = nodes.reduce((s,n) => s + n.sti, 0);
+      statsEl.textContent = `atoms: ${live}  total_sti: ${totalSTI.toFixed(1)}`;
+    })
+    .catch(() => {
+      indicator.classList.add('stale');
+      statsEl.textContent = 'bridge offline — retrying…';
+    });
+}
+
+setInterval(poll, POLL_MS);
+poll();
+</script>
+</body>
+</html>

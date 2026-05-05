@@ -39,8 +39,6 @@ typedef struct {
 /* ─────────────────────────────────────────────────────────────────────────
  * 2.  DIS VM ISOLATE CONTEXT
  *     Minimal representation of one running Dis VM execution context.
- *     In a full implementation this wraps the actual DisVM registers,
- *     stack, and heap.  Here we provide the structural envelope.
  * ───────────────────────────────────────────────────────────────────────── */
 
 #define DISVM_NREGS  16          /* Dis VM has 3 primary + general regs */
@@ -54,6 +52,7 @@ typedef struct {
     uint8_t*  heap;              /* Local heap                             */
     size_t    heap_size;
     bool      running;           /* Is this isolate currently scheduled?   */
+    void*     kernel_ref;        /* Back-pointer to CogDiodKernel          */
 } DisVMContext;
 
 /* ─────────────────────────────────────────────────────────────────────────
@@ -63,7 +62,7 @@ typedef struct {
 #define ELM_NAME_MAX  64
 #define ELM_MAGIC     0x454C4D00  /* "ELM\0" */
 
-typedef struct {
+typedef struct ElmPackage {
     uint32_t  magic;                  /* ELM_MAGIC                          */
     uint32_t  version;                /* Package format version             */
     uint32_t  type_id;                /* djb2 hash of the type name         */
@@ -81,6 +80,12 @@ typedef struct {
     /* Reference counting */
     uint32_t  ref_count;
     pthread_mutex_t ref_lock;
+
+    /* Per-package stack size (0 = use DISVM_STKMAX default) */
+    uint32_t  stack_size;
+
+    /* Hash-chain for pkg_cache collision handling */
+    struct ElmPackage* next_in_cache;
 } ElmPackage;
 
 /* ─────────────────────────────────────────────────────────────────────────
@@ -121,7 +126,19 @@ typedef struct LimboChannel {
     pthread_cond_t   not_empty;
     pthread_cond_t   not_full;
 
-    struct LimboChannel* next;   /* Intrusive linked list */
+    /* Shared-channel dual linked list nodes:
+     *   out_next — next in src->outgoing list
+     *   in_next  — next in dst->incoming list
+     * Both lists share the same LimboChannel object (no copy). */
+    struct LimboChannel* out_next;
+    struct LimboChannel* in_next;
+
+    /* Reference count (2 when created: one for each list) */
+    uint32_t         ref_count;
+
+    /* Hebbian learning weight and last fire time */
+    float            weight;
+    uint64_t         last_fire_time;
 } LimboChannel;
 
 /* ─────────────────────────────────────────────────────────────────────────
@@ -150,6 +167,13 @@ typedef struct AtomIsolate {
     /* Cognitive state */
     TruthValue   tv;
     AttentionValue av;
+
+    /* Episodic TV history (ring buffer of last 8 TV values) */
+    float        tv_history[8][2];
+    int          history_count;
+
+    /* Hebbian learning weight */
+    float        hebbian_weight;
 
     /* Topology: intrusive linked lists of channels */
     LimboChannel* incoming;            /* Channels arriving at this atom */
@@ -196,7 +220,7 @@ typedef struct {
     uint64_t      atom_count;
     pthread_rwlock_t pool_lock;
 
-    /* Package cache: type_id -> ElmPackage* */
+    /* Package cache: type_id -> ElmPackage* (chained for collision handling) */
     ElmPackage*   pkg_cache[PKG_CACHE_BUCKETS];
     uint32_t      pkg_count;
     pthread_mutex_t pkg_lock;
@@ -204,6 +228,16 @@ typedef struct {
     /* Scheduler */
     uint32_t      worker_count;
     pthread_t*    workers;
+
+    /* Run queue (circular priority queue, sorted by STI) */
+    pthread_mutex_t  run_queue_lock;
+    pthread_cond_t   run_queue_cond;
+    AtomIsolate**    run_queue;
+    uint32_t         rq_head, rq_tail, rq_cap;
+
+    /* ECAN background thread */
+    pthread_t        ecan_thread;
+    bool             ecan_enabled;
 
     /* Cognitive globals */
     float         total_sti;         /* Sum of all STI in the system */
@@ -234,6 +268,7 @@ void           cogdiod_unload_package(CogDiodKernel* k, uint32_t type_id);
 AtomIsolate*   cogdiod_spawn(CogDiodKernel* k, const char* type_name,
                              const char* atom_name);
 AtomIsolate*   cogdiod_get_atom(CogDiodKernel* k, uint64_t uuid);
+AtomIsolate*   cogdiod_get_atom_fast(CogDiodKernel* k, uint64_t uuid);
 int            cogdiod_destroy_atom(CogDiodKernel* k, uint64_t uuid);
 
 /* Channel operations */
@@ -249,6 +284,25 @@ int            cogdiod_set_tv(CogDiodKernel* k, uint64_t uuid,
                               TruthValue tv);
 TruthValue     cogdiod_get_tv(CogDiodKernel* k, uint64_t uuid);
 int            cogdiod_attend(CogDiodKernel* k, uint64_t uuid, float sti);
+
+/* Scheduler */
+int            cogdiod_enqueue(CogDiodKernel* k, AtomIsolate* a);
+
+/* ECAN */
+void           cogdiod_ecan_diffuse(CogDiodKernel* k);
+
+/* Hebbian learning */
+int            cogdiod_hebbian_update(CogDiodKernel* k,
+                                      uint64_t src_uuid, uint64_t dst_uuid);
+
+/* PLN rules (defined in pln.c) */
+TruthValue     pln_deduce(TruthValue ab, TruthValue a);
+TruthValue     pln_revise(TruthValue tv1, TruthValue tv2);
+TruthValue     pln_modus_ponens(TruthValue a, TruthValue a_implies_b);
+TruthValue     pln_abduction(TruthValue a, TruthValue b, TruthValue ab);
+TruthValue     pln_induction(TruthValue a, TruthValue b);
+TruthValue     pln_temporal_deduce(TruthValue ab, TruthValue a,
+                                   float time_steps, float decay);
 
 /* Utilities */
 uint32_t       cogdiod_hash_type(const char* name);
