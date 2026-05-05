@@ -1,54 +1,61 @@
 /*
- * elm_loader.c — Elbo (.elm) package builder and loader
+ * elm_loader.c — Elbo (.elm) package builder, loader, and Dis VM executor
+ *
+ * Includes:
+ *   - REG_BOUNDS_CHECK defensive assertions (Item 5)
+ *   - Full opcode set: ADD/SUB/MUL/DIV/JEQ/JNE/CALL/RET/LOAD/STORE/PUSH/POP (Item 6)
+ *   - OP_SEND / OP_RECV channel opcodes (Item 8)
+ *   - OP_SPAWN with kernel back-pointer (Item 9)
+ *   - PLN abduction/induction/temporal opcodes (Item 17)
+ *   - elm_load_file using ElmFileHeader format (Item 10)
+ *   - elm_exec_msg with atom lock for thread safety
  */
 
 #include "cogdiod.h"
 #include "elm_types.h"
+#include "elm_format.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 /* ─────────────────────────────────────────────────────────────────────────
- * Defensive register bounds check
+ * Bounds-check macro for register accesses (Item 5)
  * ───────────────────────────────────────────────────────────────────────── */
 
 #define REG_BOUNDS_CHECK(idx) \
-    do { \
-        if ((size_t)(idx) >= DISVM_NREGS) { \
-            fprintf(stderr, "[elm] reg OOB: %d\n", (int)(idx)); \
-            return -1; \
-        } \
-    } while (0)
+    do { if ((uint64_t)(idx) >= DISVM_NREGS) { \
+        fprintf(stderr, "[elm] register index %u out of bounds\n", (unsigned)(idx)); \
+        return -1; \
+    } } while(0)
 
 /* ─────────────────────────────────────────────────────────────────────────
- * PLN helpers (internal to VM; canonical implementations in pln.c)
+ * PLN inference rules (canonical defs in src/kernel/pln.c)
  * ───────────────────────────────────────────────────────────────────────── */
-
-static TruthValue pln_deduce(TruthValue ab, TruthValue a) {
-    float s = ab.strength * a.strength;
-    float c = ab.confidence * a.confidence * 0.9f;
-    return (TruthValue){ s, c };
-}
-
-static TruthValue pln_revise(TruthValue tv1, TruthValue tv2) {
-    float total_c = tv1.confidence + tv2.confidence;
-    if (total_c < 1e-6f) return tv1;
-    float s = (tv1.strength * tv1.confidence +
-               tv2.strength * tv2.confidence) / total_c;
-    float c = total_c / (total_c + 1.0f);
-    return (TruthValue){ s, c };
-}
+extern TruthValue pln_deduce(TruthValue ab, TruthValue a);
+extern TruthValue pln_revise(TruthValue tv1, TruthValue tv2);
+extern TruthValue pln_modus_ponens(TruthValue a, TruthValue a_implies_b);
+extern TruthValue pln_abduction(TruthValue a, TruthValue b, TruthValue ab);
+extern TruthValue pln_induction(TruthValue a, TruthValue b);
+extern TruthValue pln_temporal_deduce(TruthValue ab, TruthValue a,
+                                       float time_steps, float decay);
 
 /* ─────────────────────────────────────────────────────────────────────────
  * Minimal Dis VM interpreter
  * ───────────────────────────────────────────────────────────────────────── */
 
+/*
+ * Execute one step of the Dis VM.
+ * Returns 0 to continue, 1 to halt, -1 on error.
+ */
 static int disvm_step(DisVMContext* ctx,
                       const uint8_t* bytecode, size_t bc_size,
                       AtomIsolate* self) {
     if (ctx->pc >= bc_size) return 1;
 
     DisOpcode op = (DisOpcode)bytecode[ctx->pc++];
+    size_t stkmax = self->package->stack_size
+                    ? self->package->stack_size : DISVM_STKMAX;
 
     switch (op) {
     case OP_NOP:
@@ -57,7 +64,7 @@ static int disvm_step(DisVMContext* ctx,
     case OP_HALT:
         return 1;
 
-    /* ── Arithmetic ─────────────────────────────────────────────────── */
+    /* ── Arithmetic (Item 6) ─────────────────────────────────────────── */
     case OP_ADD:
         ctx->regs[0] = ctx->regs[1] + ctx->regs[2];
         break;
@@ -75,7 +82,7 @@ static int disvm_step(DisVMContext* ctx,
         ctx->regs[0] = ctx->regs[1] / ctx->regs[2];
         break;
 
-    /* ── Control flow ────────────────────────────────────────────────── */
+    /* ── Control flow (Item 6) ──────────────────────────────────────── */
     case OP_JMP:
         if (ctx->pc + 8 <= bc_size) {
             uint64_t target;
@@ -89,8 +96,7 @@ static int disvm_step(DisVMContext* ctx,
         uint64_t target;
         memcpy(&target, bytecode + ctx->pc, 8);
         ctx->pc += 8;
-        if (ctx->regs[0] == ctx->regs[1])
-            ctx->pc = target;
+        if (ctx->regs[0] == ctx->regs[1]) ctx->pc = target;
         break;
     }
 
@@ -99,8 +105,7 @@ static int disvm_step(DisVMContext* ctx,
         uint64_t target;
         memcpy(&target, bytecode + ctx->pc, 8);
         ctx->pc += 8;
-        if (ctx->regs[0] != ctx->regs[1])
-            ctx->pc = target;
+        if (ctx->regs[0] != ctx->regs[1]) ctx->pc = target;
         break;
     }
 
@@ -108,76 +113,73 @@ static int disvm_step(DisVMContext* ctx,
         if (ctx->pc + 8 > bc_size) return -1;
         uint64_t target;
         memcpy(&target, bytecode + ctx->pc, 8);
-        uint64_t ret_addr = ctx->pc + 8;
-        /* Push return address onto stack (8 bytes per frame slot) */
-        size_t sp_bytes = ctx->sp * 8;
-        if (sp_bytes + 8 <= DISVM_STKMAX) {
-            memcpy(ctx->stack + sp_bytes, &ret_addr, 8);
-            ctx->sp++;
+        ctx->pc += 8;
+        if (ctx->sp + 8 <= stkmax) {
+            memcpy(ctx->stack + ctx->sp, &ctx->pc, 8);
+            ctx->sp += 8;
         }
         ctx->pc = target;
         break;
     }
 
-    case OP_RET: {
-        if (ctx->sp == 0) return 1;
-        ctx->sp--;
-        uint64_t ret_addr;
-        memcpy(&ret_addr, ctx->stack + ctx->sp * 8, 8);
-        ctx->pc = ret_addr;
+    case OP_RET:
+        if (ctx->sp >= 8) {
+            ctx->sp -= 8;
+            memcpy(&ctx->pc, ctx->stack + ctx->sp, 8);
+        } else {
+            return 1; /* stack underflow = halt */
+        }
         break;
-    }
 
-    /* ── Memory ──────────────────────────────────────────────────────── */
+    /* ── Memory (Item 6) ─────────────────────────────────────────────── */
     case OP_LOAD: {
         uint64_t addr = ctx->regs[1];
-        if (addr < ctx->heap_size)
-            ctx->regs[0] = ctx->heap[addr];
+        if (addr + 8 <= ctx->heap_size)
+            memcpy(&ctx->regs[0], ctx->heap + addr, 8);
         break;
     }
 
     case OP_STORE: {
         uint64_t addr = ctx->regs[1];
-        if (addr < ctx->heap_size)
-            ctx->heap[addr] = (uint8_t)(ctx->regs[0] & 0xFF);
+        if (addr + 8 <= ctx->heap_size)
+            memcpy(ctx->heap + addr, &ctx->regs[0], 8);
         break;
     }
 
-    case OP_PUSH: {
-        size_t sp_bytes = ctx->sp * 8;
-        if (sp_bytes + 8 <= DISVM_STKMAX) {
-            memcpy(ctx->stack + sp_bytes, &ctx->regs[0], 8);
-            ctx->sp++;
+    case OP_PUSH:
+        if (ctx->sp + 8 <= stkmax) {
+            memcpy(ctx->stack + ctx->sp, &ctx->regs[0], 8);
+            ctx->sp += 8;
         }
         break;
-    }
 
-    case OP_POP: {
-        if (ctx->sp == 0) break;
-        ctx->sp--;
-        memcpy(&ctx->regs[0], ctx->stack + ctx->sp * 8, 8);
+    case OP_POP:
+        if (ctx->sp >= 8) {
+            ctx->sp -= 8;
+            memcpy(&ctx->regs[0], ctx->stack + ctx->sp, 8);
+        }
         break;
-    }
 
-    /* ── Channel operations ──────────────────────────────────────────── */
+    /* ── Channel operations (Items 8, 9) ────────────────────────────── */
     case OP_SEND: {
-        uint64_t ch_idx = ctx->regs[0];
+        /* regs[0] = channel index (into self->outgoing, 0-based) */
+        uint32_t idx = (uint32_t)ctx->regs[0];
         LimboChannel* ch = self->outgoing;
-        uint64_t i = 0;
-        while (ch && i < ch_idx) { ch = ch->out_next; i++; }
+        for (uint32_t i = 0; i < idx && ch; i++) ch = ch->out_next;
         if (ch) {
             CogMessage msg = {
-                .type        = MSG_CUSTOM,
+                .type        = MSG_UPDATE_TV,
                 .sender_uuid = self->uuid,
             };
-            memcpy(&msg.payload, &ctx->regs[1],
-                   sizeof(msg.payload) < 8 ? sizeof(msg.payload) : 8);
+            memcpy(&msg.tv.strength,   &ctx->regs[1], 4);
+            memcpy(&msg.tv.confidence, &ctx->regs[2], 4);
             cogdiod_send(ch, &msg);
         }
         break;
     }
 
     case OP_RECV: {
+        /* Non-blocking recv from first incoming channel with a message */
         LimboChannel* ch = self->incoming;
         if (ch) {
             pthread_mutex_lock(&ch->lock);
@@ -186,24 +188,28 @@ static int disvm_step(DisVMContext* ctx,
                 ch->head = (ch->head + 1) % CHANNEL_BUF_MAX;
                 pthread_cond_signal(&ch->not_full);
                 pthread_mutex_unlock(&ch->lock);
-                ctx->regs[0] = msg.type;
-                ctx->regs[1] = msg.sender_uuid;
+                REG_BOUNDS_CHECK(8);
+                REG_BOUNDS_CHECK(9);
+                REG_BOUNDS_CHECK(10);
+                REG_BOUNDS_CHECK(11);
+                ctx->regs[8] = msg.type;
+                ctx->regs[9] = msg.sender_uuid;
+                memcpy(&ctx->regs[10], &msg.tv.strength,   4);
+                memcpy(&ctx->regs[11], &msg.tv.confidence, 4);
             } else {
                 pthread_mutex_unlock(&ch->lock);
-                ctx->regs[0] = 0;
             }
         }
         break;
     }
 
     case OP_SPAWN: {
-        if (self->vm_ctx.kernel_ref) {
-            CogDiodKernel* k = (CogDiodKernel*)self->vm_ctx.kernel_ref;
-            char type_buf[ELM_NAME_MAX];
-            snprintf(type_buf, sizeof(type_buf), "type_%llu",
-                     (unsigned long long)ctx->regs[0]);
-            cogdiod_spawn(k, type_buf, NULL);
-        }
+        /* Spawn a ConceptNode via kernel back-pointer */
+        if (!self->vm_ctx.kernel_ref) break;
+        CogDiodKernel* k = (CogDiodKernel*)self->vm_ctx.kernel_ref;
+        AtomIsolate* child = cogdiod_spawn(k, "ConceptNode", NULL);
+        if (child) ctx->regs[0] = child->uuid;
+        else       ctx->regs[0] = 0;
         break;
     }
 
@@ -253,53 +259,8 @@ static int disvm_step(DisVMContext* ctx,
         break;
     }
 
-    case OP_PLN_ABD: {
-        /* regs[0..1]=a, regs[2..3]=b, regs[4..5]=ab → regs[6..7] */
-        TruthValue a, b, ab;
-        memcpy(&a.strength,    &ctx->regs[0], 4);
-        memcpy(&a.confidence,  &ctx->regs[1], 4);
-        memcpy(&b.strength,    &ctx->regs[2], 4);
-        memcpy(&b.confidence,  &ctx->regs[3], 4);
-        memcpy(&ab.strength,   &ctx->regs[4], 4);
-        memcpy(&ab.confidence, &ctx->regs[5], 4);
-        TruthValue result = pln_abduction(a, b, ab);
-        REG_BOUNDS_CHECK(7);
-        memcpy(&ctx->regs[6], &result.strength,   4);
-        memcpy(&ctx->regs[7], &result.confidence, 4);
-        break;
-    }
-
-    case OP_PLN_IND: {
-        /* regs[0..1]=a, regs[2..3]=b → regs[4..5] */
-        TruthValue a, b;
-        memcpy(&a.strength,   &ctx->regs[0], 4);
-        memcpy(&a.confidence, &ctx->regs[1], 4);
-        memcpy(&b.strength,   &ctx->regs[2], 4);
-        memcpy(&b.confidence, &ctx->regs[3], 4);
-        TruthValue result = pln_induction(a, b);
-        memcpy(&ctx->regs[4], &result.strength,   4);
-        memcpy(&ctx->regs[5], &result.confidence, 4);
-        break;
-    }
-
-    case OP_PLN_TMP: {
-        /* regs[0..1]=ab, regs[2..3]=a, regs[4]=steps, regs[5]=decay */
-        TruthValue ab, a;
-        float steps, decay;
-        memcpy(&ab.strength,   &ctx->regs[0], 4);
-        memcpy(&ab.confidence, &ctx->regs[1], 4);
-        memcpy(&a.strength,    &ctx->regs[2], 4);
-        memcpy(&a.confidence,  &ctx->regs[3], 4);
-        memcpy(&steps,         &ctx->regs[4], 4);
-        memcpy(&decay,         &ctx->regs[5], 4);
-        TruthValue result = pln_temporal_deduce(ab, a, steps, decay);
-        REG_BOUNDS_CHECK(7);
-        memcpy(&ctx->regs[6], &result.strength,   4);
-        memcpy(&ctx->regs[7], &result.confidence, 4);
-        break;
-    }
-
     case OP_ECAN_SP: {
+        /* Spread half of STI to outgoing channels */
         float spread = self->av.sti * 0.5f;
         self->av.sti -= spread;
         LimboChannel* ch = self->outgoing;
@@ -319,7 +280,54 @@ static int disvm_step(DisVMContext* ctx,
         break;
     }
 
+    /* ── PLN extended rules (Item 17) ───────────────────────────────── */
+    case OP_PLN_ABD: {
+        /* Abduction: regs[0..1]=a, regs[2..3]=b, regs[4..5]=ab → regs[6..7] */
+        TruthValue a, b, ab;
+        memcpy(&a.strength,    &ctx->regs[0], 4);
+        memcpy(&a.confidence,  &ctx->regs[1], 4);
+        memcpy(&b.strength,    &ctx->regs[2], 4);
+        memcpy(&b.confidence,  &ctx->regs[3], 4);
+        memcpy(&ab.strength,   &ctx->regs[4], 4);
+        memcpy(&ab.confidence, &ctx->regs[5], 4);
+        TruthValue result = pln_abduction(a, b, ab);
+        memcpy(&ctx->regs[6], &result.strength,   4);
+        memcpy(&ctx->regs[7], &result.confidence, 4);
+        break;
+    }
+
+    case OP_PLN_IND: {
+        /* Induction: regs[0..1]=a, regs[2..3]=b → regs[4..5] */
+        TruthValue a, b;
+        memcpy(&a.strength,   &ctx->regs[0], 4);
+        memcpy(&a.confidence, &ctx->regs[1], 4);
+        memcpy(&b.strength,   &ctx->regs[2], 4);
+        memcpy(&b.confidence, &ctx->regs[3], 4);
+        TruthValue result = pln_induction(a, b);
+        memcpy(&ctx->regs[4], &result.strength,   4);
+        memcpy(&ctx->regs[5], &result.confidence, 4);
+        break;
+    }
+
+    case OP_PLN_TMP: {
+        /* Temporal deduction: regs[0..1]=ab, regs[2..3]=a,
+         * regs[4]=time_steps, regs[5]=decay → regs[6..7] */
+        TruthValue ab, a;
+        memcpy(&ab.strength,   &ctx->regs[0], 4);
+        memcpy(&ab.confidence, &ctx->regs[1], 4);
+        memcpy(&a.strength,    &ctx->regs[2], 4);
+        memcpy(&a.confidence,  &ctx->regs[3], 4);
+        float time_steps, decay;
+        memcpy(&time_steps, &ctx->regs[4], 4);
+        memcpy(&decay,      &ctx->regs[5], 4);
+        TruthValue result = pln_temporal_deduce(ab, a, time_steps, decay);
+        memcpy(&ctx->regs[6], &result.strength,   4);
+        memcpy(&ctx->regs[7], &result.confidence, 4);
+        break;
+    }
+
     default:
+        /* Unknown opcode — skip */
         break;
     }
     return 0;
@@ -341,16 +349,26 @@ static void disvm_run(DisVMContext* ctx,
 
 int elm_exec_init(AtomIsolate* a) {
     if (!a || !a->package) return -1;
+    pthread_mutex_lock(&a->lock);
     a->vm_ctx.pc = a->package->ep_init;
     disvm_run(&a->vm_ctx,
               a->package->dis_bytecode,
               a->package->bytecode_size,
               a);
+    pthread_mutex_unlock(&a->lock);
     return 0;
 }
 
 int elm_exec_msg(AtomIsolate* a, const CogMessage* msg) {
     if (!a || !a->package) return -1;
+
+    /* Serialize VM execution per atom */
+    pthread_mutex_lock(&a->lock);
+
+    REG_BOUNDS_CHECK(8);
+    REG_BOUNDS_CHECK(9);
+    REG_BOUNDS_CHECK(10);
+    REG_BOUNDS_CHECK(11);
 
     a->vm_ctx.regs[8]  = msg->type;
     a->vm_ctx.regs[9]  = msg->sender_uuid;
@@ -362,6 +380,8 @@ int elm_exec_msg(AtomIsolate* a, const CogMessage* msg) {
               a->package->dis_bytecode,
               a->package->bytecode_size,
               a);
+
+    pthread_mutex_unlock(&a->lock);
     return 0;
 }
 
@@ -403,13 +423,70 @@ ElmPackage* elm_build_stub(const ElmStubDef* def) {
     return pkg;
 }
 
+/* ─────────────────────────────────────────────────────────────────────────
+ * Save / load .elm files  (Item 10: ElmFileHeader format)
+ * ───────────────────────────────────────────────────────────────────────── */
+
 int elm_save(const ElmPackage* pkg, const char* path) {
     FILE* f = fopen(path, "wb");
     if (!f) return -1;
-    fwrite(pkg, sizeof(ElmPackage) - sizeof(uint8_t*) - sizeof(pthread_mutex_t)
-               - sizeof(struct ElmPackage*) - sizeof(uint32_t), 1, f);
+
+    ElmFileHeader hdr;
+    memset(&hdr, 0, sizeof(hdr));
+    hdr.magic         = ELM_FILE_MAGIC;
+    hdr.version       = ELM_FILE_VERSION;
+    hdr.type_id       = pkg->type_id;
+    hdr.flags         = 0;
+    hdr.ep_init       = pkg->ep_init;
+    hdr.ep_on_message = pkg->ep_on_message;
+    hdr.ep_on_gc      = pkg->ep_on_gc;
+    hdr.bytecode_size = (uint32_t)pkg->bytecode_size;
+    hdr.symtab_count  = 0;
+    strncpy(hdr.type_name, pkg->name, 63);
+
+    fwrite(&hdr, sizeof(hdr), 1, f);
     fwrite(pkg->dis_bytecode, 1, pkg->bytecode_size, f);
     fclose(f);
     fprintf(stderr, "[elm] saved '%s' to %s\n", pkg->name, path);
     return 0;
+}
+
+ElmPackage* elm_load_file(const char* path) {
+    FILE* f = fopen(path, "rb");
+    if (!f) return NULL;
+
+    ElmFileHeader hdr;
+    if (fread(&hdr, sizeof(hdr), 1, f) != 1 ||
+        hdr.magic != ELM_FILE_MAGIC) {
+        fclose(f);
+        return NULL;
+    }
+
+    uint8_t* bc = malloc(hdr.bytecode_size);
+    if (!bc || fread(bc, 1, hdr.bytecode_size, f) != hdr.bytecode_size) {
+        free(bc);
+        fclose(f);
+        return NULL;
+    }
+    fclose(f);
+
+    ElmPackage* pkg = calloc(1, sizeof(ElmPackage));
+    if (!pkg) { free(bc); return NULL; }
+
+    pkg->magic         = ELM_MAGIC;
+    pkg->version       = hdr.version;
+    pkg->type_id       = hdr.type_id;
+    pkg->ep_init       = hdr.ep_init;
+    pkg->ep_on_message = hdr.ep_on_message;
+    pkg->ep_on_gc      = hdr.ep_on_gc;
+    pkg->dis_bytecode  = bc;
+    pkg->bytecode_size = hdr.bytecode_size;
+    pkg->ref_count     = 0;
+    pkg->next_in_cache = NULL;
+    strncpy(pkg->name, hdr.type_name, ELM_NAME_MAX - 1);
+    pthread_mutex_init(&pkg->ref_lock, NULL);
+
+    fprintf(stderr, "[elm] loaded '%s' from %s (%u bytes)\n",
+            pkg->name, path, hdr.bytecode_size);
+    return pkg;
 }

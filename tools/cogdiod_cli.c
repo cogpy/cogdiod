@@ -1,138 +1,178 @@
 /*
- * cogdiod_cli.c — CogDiod command-line client
- *
- * Connects to cogdiod_bridge on UNIX socket /tmp/cogdiod.sock
- * (or TCP port 19999 when given --tcp flag) and sends JSON requests
- * entered interactively or from a script.
+ * cogdiod_cli.c — Command-line interface for the CogDiod bridge
  *
  * Usage:
- *   cogdiod_cli [--tcp [host[:port]]]
- *   echo '{"op":"stats"}' | cogdiod_cli
+ *   cogdiod-cli spawn <Type> <name> <strength> <confidence>
+ *   cogdiod-cli get-tv <uuid>
+ *   cogdiod-cli set-tv <uuid> <strength> <confidence>
+ *   cogdiod-cli link <from_uuid> <to_uuid>
+ *   cogdiod-cli unlink <from_uuid> <to_uuid>
+ *   cogdiod-cli destroy <uuid>
+ *   cogdiod-cli attend <uuid> <delta>
+ *   cogdiod-cli get-sti <uuid>
+ *   cogdiod-cli get-links <uuid>
+ *   cogdiod-cli pln-deduce <ant_uuid> <impl_uuid>
+ *   cogdiod-cli pln-revise <uuid> <strength2> <confidence2>
+ *   cogdiod-cli episodic <uuid> <version>
+ *   cogdiod-cli stats
+ *   cogdiod-cli snapshot
  *
- * Build:
- *   cc -O2 -std=c11 -o cogdiod_cli tools/cogdiod_cli.c
+ * Connects to /tmp/cogdiod.sock (UNIX domain socket).
+ *
+ * Build:  cc -O2 -std=c11 -o cogdiod-cli tools/cogdiod_cli.c
  */
+
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdint.h>
-#include <unistd.h>
 #include <sys/socket.h>
 #include <sys/un.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <errno.h>
+#include <unistd.h>
 
 #define SOCK_PATH "/tmp/cogdiod.sock"
-#define TCP_PORT  19999
-#define BUF       65536
+#define BUF_SIZE  65536
 
-static int connect_unix(void) {
-    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (fd < 0) { perror("socket"); return -1; }
+static int g_fd = -1;
+
+static int bridge_connect(void) {
+    g_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (g_fd < 0) { perror("socket"); return -1; }
     struct sockaddr_un addr = {0};
     addr.sun_family = AF_UNIX;
     strncpy(addr.sun_path, SOCK_PATH, sizeof(addr.sun_path)-1);
-    if (connect(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        perror("connect(unix)");
-        close(fd);
-        return -1;
+    if (connect(g_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        perror("connect"); return -1;
     }
-    return fd;
-}
-
-static int connect_tcp(const char* host, uint16_t port) {
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) { perror("socket"); return -1; }
-    struct sockaddr_in addr = {0};
-    addr.sin_family = AF_INET;
-    addr.sin_port   = htons(port);
-    if (!host || strcmp(host, "localhost") == 0 || strcmp(host, "127.0.0.1") == 0) {
-        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    } else {
-        inet_aton(host, &addr.sin_addr);
-    }
-    if (connect(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        perror("connect(tcp)");
-        close(fd);
-        return -1;
-    }
-    return fd;
-}
-
-/* Send a JSON line and print the response */
-static int do_request(int fd, const char* line) {
-    /* Send */
-    size_t n = strlen(line);
-    char buf[BUF + 2];
-    memcpy(buf, line, n);
-    buf[n]   = '\n';
-    buf[n+1] = '\0';
-    if (send(fd, buf, n+1, 0) < 0) { perror("send"); return -1; }
-
-    /* Receive line */
-    size_t rn = 0;
-    char resp[BUF+1];
-    while (rn < BUF) {
-        ssize_t got = recv(fd, resp + rn, 1, 0);
-        if (got <= 0) break;
-        if (resp[rn] == '\n') break;
-        rn++;
-    }
-    resp[rn] = '\0';
-    printf("%s\n", resp);
     return 0;
 }
 
+static void bridge_call(const char* json) {
+    char buf[BUF_SIZE];
+    /* Send request + newline */
+    size_t len = strlen(json);
+    if (len + 2 > BUF_SIZE) { fprintf(stderr, "request too long\n"); return; }
+    memcpy(buf, json, len);
+    buf[len]   = '\n';
+    buf[len+1] = '\0';
+    send(g_fd, buf, len+1, 0);
+    /* Read response */
+    ssize_t n = recv(g_fd, buf, sizeof(buf)-1, 0);
+    if (n <= 0) { fprintf(stderr, "no response\n"); return; }
+    buf[n] = '\0';
+    printf("%s", buf);
+    if (buf[n-1] != '\n') printf("\n");
+}
+
+static void usage(void) {
+    fprintf(stderr,
+        "cogdiod-cli — CogDiod bridge command-line interface\n"
+        "Connects to " SOCK_PATH "\n\n"
+        "Commands:\n"
+        "  spawn <Type> <name> <strength> <confidence>\n"
+        "  get-tv <uuid>\n"
+        "  set-tv <uuid> <strength> <confidence>\n"
+        "  link <from> <to>\n"
+        "  unlink <from> <to>\n"
+        "  destroy <uuid>\n"
+        "  attend <uuid> <delta>\n"
+        "  get-sti <uuid>\n"
+        "  get-links <uuid>\n"
+        "  pln-deduce <ant_uuid> <impl_uuid>\n"
+        "  pln-revise <uuid> <strength2> <confidence2>\n"
+        "  episodic <uuid> <version>\n"
+        "  stats\n"
+        "  snapshot\n");
+}
+
 int main(int argc, char** argv) {
-    int use_tcp = 0;
-    const char* tcp_host = "127.0.0.1";
-    uint16_t    tcp_port = TCP_PORT;
+    if (argc < 2) { usage(); return 1; }
 
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--tcp") == 0) {
-            use_tcp = 1;
-            if (i+1 < argc && argv[i+1][0] != '-') {
-                i++;
-                /* May be host or host:port */
-                char* colon = strchr(argv[i], ':');
-                if (colon) {
-                    *colon = '\0';
-                    tcp_host = argv[i];
-                    tcp_port = (uint16_t)atoi(colon+1);
-                } else {
-                    tcp_host = argv[i];
-                }
-            }
-        }
+    if (bridge_connect() != 0) {
+        fprintf(stderr, "Could not connect to bridge at %s\n"
+                        "Is cogdiod_bridge running?\n", SOCK_PATH);
+        return 1;
     }
 
-    int fd = use_tcp ? connect_tcp(tcp_host, tcp_port) : connect_unix();
-    if (fd < 0) return 1;
+    char json[BUF_SIZE];
+    const char* cmd = argv[1];
 
-    int interactive = isatty(STDIN_FILENO);
-    char line[BUF];
+    if (strcmp(cmd, "spawn") == 0) {
+        if (argc < 6) { fprintf(stderr, "usage: spawn <Type> <name> <s> <c>\n"); return 1; }
+        snprintf(json, sizeof(json),
+            "{\"op\":\"spawn\",\"type\":\"%s\",\"name\":\"%s\","
+            "\"strength\":%s,\"confidence\":%s}",
+            argv[2], argv[3], argv[4], argv[5]);
 
-    if (interactive) {
-        fprintf(stderr, "cogdiod_cli connected (%s)\n",
-                use_tcp ? "TCP" : "UNIX");
-        fprintf(stderr, "Enter JSON requests, one per line. Ctrl-D to exit.\n");
+    } else if (strcmp(cmd, "get-tv") == 0) {
+        if (argc < 3) { fprintf(stderr, "usage: get-tv <uuid>\n"); return 1; }
+        snprintf(json, sizeof(json), "{\"op\":\"get_tv\",\"uuid\":%s}", argv[2]);
+
+    } else if (strcmp(cmd, "set-tv") == 0) {
+        if (argc < 5) { fprintf(stderr, "usage: set-tv <uuid> <s> <c>\n"); return 1; }
+        snprintf(json, sizeof(json),
+            "{\"op\":\"set_tv\",\"uuid\":%s,\"strength\":%s,\"confidence\":%s}",
+            argv[2], argv[3], argv[4]);
+
+    } else if (strcmp(cmd, "link") == 0) {
+        if (argc < 4) { fprintf(stderr, "usage: link <from> <to>\n"); return 1; }
+        snprintf(json, sizeof(json),
+            "{\"op\":\"link\",\"from\":%s,\"to\":%s}", argv[2], argv[3]);
+
+    } else if (strcmp(cmd, "unlink") == 0) {
+        if (argc < 4) { fprintf(stderr, "usage: unlink <from> <to>\n"); return 1; }
+        snprintf(json, sizeof(json),
+            "{\"op\":\"unlink\",\"from\":%s,\"to\":%s}", argv[2], argv[3]);
+
+    } else if (strcmp(cmd, "destroy") == 0) {
+        if (argc < 3) { fprintf(stderr, "usage: destroy <uuid>\n"); return 1; }
+        snprintf(json, sizeof(json), "{\"op\":\"destroy\",\"uuid\":%s}", argv[2]);
+
+    } else if (strcmp(cmd, "attend") == 0) {
+        if (argc < 4) { fprintf(stderr, "usage: attend <uuid> <delta>\n"); return 1; }
+        snprintf(json, sizeof(json),
+            "{\"op\":\"attend\",\"uuid\":%s,\"delta\":%s}", argv[2], argv[3]);
+
+    } else if (strcmp(cmd, "get-sti") == 0) {
+        if (argc < 3) { fprintf(stderr, "usage: get-sti <uuid>\n"); return 1; }
+        snprintf(json, sizeof(json), "{\"op\":\"get_sti\",\"uuid\":%s}", argv[2]);
+
+    } else if (strcmp(cmd, "get-links") == 0) {
+        if (argc < 3) { fprintf(stderr, "usage: get-links <uuid>\n"); return 1; }
+        snprintf(json, sizeof(json), "{\"op\":\"get_links\",\"uuid\":%s}", argv[2]);
+
+    } else if (strcmp(cmd, "pln-deduce") == 0) {
+        if (argc < 4) { fprintf(stderr, "usage: pln-deduce <ant_uuid> <impl_uuid>\n"); return 1; }
+        snprintf(json, sizeof(json),
+            "{\"op\":\"pln_deduce\",\"ant_uuid\":%s,\"impl_uuid\":%s}",
+            argv[2], argv[3]);
+
+    } else if (strcmp(cmd, "pln-revise") == 0) {
+        if (argc < 5) { fprintf(stderr, "usage: pln-revise <uuid> <s2> <c2>\n"); return 1; }
+        snprintf(json, sizeof(json),
+            "{\"op\":\"pln_revise\",\"uuid\":%s,\"strength2\":%s,\"confidence2\":%s}",
+            argv[2], argv[3], argv[4]);
+
+    } else if (strcmp(cmd, "episodic") == 0) {
+        if (argc < 4) { fprintf(stderr, "usage: episodic <uuid> <version>\n"); return 1; }
+        snprintf(json, sizeof(json),
+            "{\"op\":\"episodic\",\"uuid\":%s,\"version\":%s}",
+            argv[2], argv[3]);
+
+    } else if (strcmp(cmd, "stats") == 0) {
+        snprintf(json, sizeof(json), "{\"op\":\"stats\"}");
+
+    } else if (strcmp(cmd, "snapshot") == 0) {
+        snprintf(json, sizeof(json), "{\"op\":\"snapshot\"}");
+
+    } else {
+        fprintf(stderr, "Unknown command: %s\n", cmd);
+        usage();
+        close(g_fd);
+        return 1;
     }
 
-    while (1) {
-        if (interactive) fprintf(stderr, "> ");
-        if (!fgets(line, sizeof(line), stdin)) break;
-
-        /* Strip trailing newline */
-        size_t len = strlen(line);
-        while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r'))
-            line[--len] = '\0';
-        if (len == 0) continue;
-
-        if (do_request(fd, line) < 0) break;
-    }
-
-    close(fd);
+    bridge_call(json);
+    close(g_fd);
     return 0;
 }

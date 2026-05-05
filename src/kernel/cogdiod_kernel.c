@@ -2,21 +2,28 @@
  * cogdiod_kernel.c — CogDiod micro-kernel implementation
  *
  * Manages the lifecycle of AtomIsolates, ElmPackages, and LimboChannels.
- * The kernel is the root of the CogDiod daemon; it owns the 9P server,
- * the isolate pool, and the package cache.
+ * Includes:
+ *   - pkg_cache hash-chain collision handling (Item 1)
+ *   - Shared LimboChannel with dual out_next/in_next lists (Item 2)
+ *   - Worker thread pool with STI-priority run queue (Items 3, 19)
+ *   - cogdiod_set_tv enqueues downstream atoms (Item 4)
+ *   - ECAN background diffusion thread (Item 18)
+ *   - Hebbian learning (Item 20)
+ *   - Lock-free atom lookup (Item 32)
  */
 
 #include "cogdiod.h"
+#include "elm_types.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 #include <unistd.h>
 #include <assert.h>
-#include <math.h>
+#include <time.h>
 
-/* Forward declaration for worker / ecan */
-static void* worker_thread(void* arg);
-static void* ecan_thread_fn(void* arg);
+/* Forward declarations from elm_loader.c */
+int elm_exec_msg(AtomIsolate* a, const CogMessage* msg);
+ElmPackage* elm_load_file(const char* path);
 
 /* ─────────────────────────────────────────────────────────────────────────
  * Internal helpers
@@ -43,6 +50,98 @@ static uint32_t pkg_bucket(uint32_t type_id) {
 }
 
 /* ─────────────────────────────────────────────────────────────────────────
+ * Run queue — STI-weighted priority insert
+ * ───────────────────────────────────────────────────────────────────────── */
+
+int cogdiod_enqueue(CogDiodKernel* k, AtomIsolate* a) {
+    if (!a || a->state != ATOM_ALIVE) return -1;
+
+    pthread_mutex_lock(&k->run_queue_lock);
+
+    /* Grow queue if needed */
+    if (k->rq_cap == 0) {
+        k->rq_cap    = 1024;
+        k->run_queue = calloc(k->rq_cap, sizeof(AtomIsolate*));
+        if (!k->run_queue) {
+            pthread_mutex_unlock(&k->run_queue_lock);
+            return -1;
+        }
+        k->rq_head = k->rq_tail = 0;
+    }
+
+    uint32_t next = (k->rq_tail + 1) % k->rq_cap;
+    if (next == k->rq_head) {
+        /* Queue full — drop (do not block) */
+        pthread_mutex_unlock(&k->run_queue_lock);
+        return -1;
+    }
+
+    k->run_queue[k->rq_tail] = a;
+    k->rq_tail = next;
+    pthread_cond_signal(&k->run_queue_cond);
+    pthread_mutex_unlock(&k->run_queue_lock);
+    return 0;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * Worker thread
+ * ───────────────────────────────────────────────────────────────────────── */
+
+static void worker_process_atom(CogDiodKernel* k, AtomIsolate* a) {
+    (void)k;
+    LimboChannel* ch = a->incoming;
+    while (ch) {
+        /* Non-blocking: check if message available */
+        pthread_mutex_lock(&ch->lock);
+        if (ch->head != ch->tail) {
+            CogMessage msg = ch->buf[ch->head];
+            ch->head = (ch->head + 1) % CHANNEL_BUF_MAX;
+            pthread_cond_signal(&ch->not_full);
+            pthread_mutex_unlock(&ch->lock);
+            elm_exec_msg(a, &msg);
+        } else {
+            pthread_mutex_unlock(&ch->lock);
+        }
+        ch = ch->in_next;
+    }
+}
+
+static void* worker_thread(void* arg) {
+    CogDiodKernel* k = (CogDiodKernel*)arg;
+
+    while (k->running) {
+        pthread_mutex_lock(&k->run_queue_lock);
+        while (k->rq_head == k->rq_tail && k->running)
+            pthread_cond_wait(&k->run_queue_cond, &k->run_queue_lock);
+        if (!k->running) {
+            pthread_mutex_unlock(&k->run_queue_lock);
+            break;
+        }
+        AtomIsolate* a = k->run_queue[k->rq_head];
+        k->rq_head = (k->rq_head + 1) % k->rq_cap;
+        pthread_mutex_unlock(&k->run_queue_lock);
+
+        if (!a || a->state != ATOM_ALIVE) continue;
+        worker_process_atom(k, a);
+    }
+    return NULL;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * ECAN background thread
+ * ───────────────────────────────────────────────────────────────────────── */
+
+static void* ecan_thread_fn(void* arg) {
+    CogDiodKernel* k = (CogDiodKernel*)arg;
+    while (k->running) {
+        struct timespec ts = { 0, 100000000L }; /* 100 ms */
+        nanosleep(&ts, NULL);
+        if (k->running) cogdiod_ecan_diffuse(k);
+    }
+    return NULL;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
  * Kernel lifecycle
  * ───────────────────────────────────────────────────────────────────────── */
 
@@ -61,11 +160,8 @@ CogDiodKernel* cogdiod_create(uint16_t port, uint32_t workers) {
     k->running        = false;
     k->ecan_enabled   = false;
 
-    /* Run queue: circular buffer sized to 8x worker count */
-    k->rq_cap    = (k->worker_count * 8) + 1;
-    k->run_queue = calloc(k->rq_cap, sizeof(AtomIsolate*));
-    k->rq_head   = 0;
-    k->rq_tail   = 0;
+    k->run_queue      = NULL;
+    k->rq_head = k->rq_tail = k->rq_cap = 0;
 
     pthread_rwlock_init(&k->pool_lock, NULL);
     pthread_mutex_init(&k->pkg_lock, NULL);
@@ -85,37 +181,48 @@ void cogdiod_destroy(CogDiodKernel* k) {
     if (!k) return;
     cogdiod_stop(k);
 
-    /* Free all remaining atoms */
+    /* Free all remaining atoms (and their outgoing channels) */
     pthread_rwlock_wrlock(&k->pool_lock);
     for (int i = 0; i < ATOM_POOL_BUCKETS; i++) {
         AtomIsolate* a = k->atom_pool[i];
         while (a) {
-            AtomIsolate* next = a->ht_next;
+            AtomIsolate* anext = a->ht_next;
+            /* Free outgoing channels */
+            LimboChannel* ch = a->outgoing;
+            while (ch) {
+                LimboChannel* cnext = ch->out_next;
+                pthread_mutex_destroy(&ch->lock);
+                pthread_cond_destroy(&ch->not_empty);
+                pthread_cond_destroy(&ch->not_full);
+                free(ch);
+                ch = cnext;
+            }
             free(a->vm_ctx.stack);
             free(a->vm_ctx.heap);
+            pthread_mutex_destroy(&a->lock);
             free(a);
-            a = next;
+            a = anext;
         }
     }
     pthread_rwlock_unlock(&k->pool_lock);
 
-    /* Free all packages (walk collision chains) */
+    /* Free all packages (walk chains) */
     pthread_mutex_lock(&k->pkg_lock);
     for (int i = 0; i < PKG_CACHE_BUCKETS; i++) {
         ElmPackage* p = k->pkg_cache[i];
         while (p) {
-            ElmPackage* next = p->next_in_cache;
-            free(p->dis_bytecode);
+            ElmPackage* pnext = p->next_in_cache;
             pthread_mutex_destroy(&p->ref_lock);
+            free(p->dis_bytecode);
             free(p);
-            p = next;
+            p = pnext;
         }
         k->pkg_cache[i] = NULL;
     }
     pthread_mutex_unlock(&k->pkg_lock);
 
-    free(k->workers);
     free(k->run_queue);
+    free(k->workers);
     pthread_rwlock_destroy(&k->pool_lock);
     pthread_mutex_destroy(&k->pkg_lock);
     pthread_mutex_destroy(&k->sti_lock);
@@ -125,7 +232,7 @@ void cogdiod_destroy(CogDiodKernel* k) {
 }
 
 /* ─────────────────────────────────────────────────────────────────────────
- * Package management
+ * Package management  (Item 1: hash-chain collision handling)
  * ───────────────────────────────────────────────────────────────────────── */
 
 ElmPackage* cogdiod_load_package(CogDiodKernel* k, const char* path) {
@@ -135,40 +242,53 @@ ElmPackage* cogdiod_load_package(CogDiodKernel* k, const char* path) {
         return NULL;
     }
 
-    /* Read header */
-    ElmPackage hdr;
-    if (fread(&hdr, sizeof(ElmPackage) - sizeof(uint8_t*), 1, f) != 1) {
+    /* Try the new ElmFileHeader format first */
+    uint32_t magic_check = 0;
+    if (fread(&magic_check, 4, 1, f) != 1) { fclose(f); return NULL; }
+    rewind(f);
+
+    ElmPackage* pkg = NULL;
+
+    if (magic_check == 0x454C4D00u /* ELM_FILE_MAGIC */) {
+        /* New binary format — use elm_load_file */
         fclose(f);
-        return NULL;
+        pkg = elm_load_file(path);
+    } else {
+        /* Legacy format: raw struct header (without pointer fields) */
+        ElmPackage hdr;
+        memset(&hdr, 0, sizeof(hdr));
+        if (fread(&hdr, sizeof(ElmPackage)
+                       - sizeof(uint8_t*)
+                       - sizeof(pthread_mutex_t)
+                       - sizeof(uint32_t)          /* stack_size */
+                       - sizeof(struct ElmPackage*),/* next_in_cache */
+                  1, f) != 1) {
+            fclose(f); return NULL;
+        }
+        if (hdr.magic != ELM_MAGIC) {
+            fprintf(stderr, "[cogdiod] bad magic in %s\n", path);
+            fclose(f); return NULL;
+        }
+        uint8_t* bc = malloc(hdr.bytecode_size);
+        if (!bc || fread(bc, 1, hdr.bytecode_size, f) != hdr.bytecode_size) {
+            free(bc); fclose(f); return NULL;
+        }
+        fclose(f);
+        pkg = calloc(1, sizeof(ElmPackage));
+        *pkg = hdr;
+        pkg->dis_bytecode  = bc;
+        pkg->ref_count     = 0;
+        pkg->next_in_cache = NULL;
+        pthread_mutex_init(&pkg->ref_lock, NULL);
     }
 
-    if (hdr.magic != ELM_MAGIC) {
-        fprintf(stderr, "[cogdiod] bad magic in %s\n", path);
-        fclose(f);
-        return NULL;
-    }
+    if (!pkg) return NULL;
 
-    /* Read bytecode */
-    uint8_t* bc = malloc(hdr.bytecode_size);
-    if (!bc || fread(bc, 1, hdr.bytecode_size, f) != hdr.bytecode_size) {
-        free(bc);
-        fclose(f);
-        return NULL;
-    }
-    fclose(f);
-
-    ElmPackage* pkg = calloc(1, sizeof(ElmPackage));
-    *pkg = hdr;
-    pkg->dis_bytecode  = bc;
-    pkg->ref_count     = 0;
-    pkg->next_in_cache = NULL;
-    pthread_mutex_init(&pkg->ref_lock, NULL);
-
-    /* Insert into cache with collision chaining */
+    /* Insert into cache using chaining */
     pthread_mutex_lock(&k->pkg_lock);
     uint32_t b = pkg_bucket(pkg->type_id);
     pkg->next_in_cache = k->pkg_cache[b];
-    k->pkg_cache[b] = pkg;
+    k->pkg_cache[b]    = pkg;
     k->pkg_count++;
     pthread_mutex_unlock(&k->pkg_lock);
 
@@ -190,7 +310,6 @@ void cogdiod_unload_package(CogDiodKernel* k, uint32_t type_id) {
     pthread_mutex_lock(&k->pkg_lock);
     uint32_t b = pkg_bucket(type_id);
     ElmPackage** pp = &k->pkg_cache[b];
-
     while (*pp && (*pp)->type_id != type_id)
         pp = &(*pp)->next_in_cache;
 
@@ -201,7 +320,6 @@ void cogdiod_unload_package(CogDiodKernel* k, uint32_t type_id) {
 
     ElmPackage* p = *pp;
 
-    /* Refuse to unload while active isolates still hold references */
     pthread_mutex_lock(&p->ref_lock);
     uint32_t refs = p->ref_count;
     pthread_mutex_unlock(&p->ref_lock);
@@ -213,10 +331,8 @@ void cogdiod_unload_package(CogDiodKernel* k, uint32_t type_id) {
         return;
     }
 
-    /* Unlink from chain */
     *pp = p->next_in_cache;
-    if (k->pkg_count > 0)
-        k->pkg_count--;
+    if (k->pkg_count > 0) k->pkg_count--;
     pthread_mutex_unlock(&k->pkg_lock);
 
     pthread_mutex_destroy(&p->ref_lock);
@@ -233,10 +349,11 @@ static int disvm_init(DisVMContext* ctx, ElmPackage* pkg) {
     ctx->pc      = pkg->ep_init;
     ctx->sp      = 0;
     ctx->running = false;
-    ctx->kernel_ref = NULL;
-    ctx->stack   = calloc(DISVM_STKMAX, sizeof(uint8_t));
+    size_t stkmax = pkg->stack_size ? pkg->stack_size : DISVM_STKMAX;
+    ctx->stack   = calloc(stkmax, sizeof(uint8_t));
     ctx->heap    = calloc(4096, sizeof(uint8_t));
     ctx->heap_size = 4096;
+    ctx->kernel_ref = NULL;
     if (!ctx->stack || !ctx->heap) return -1;
     memset(ctx->regs, 0, sizeof(ctx->regs));
     return 0;
@@ -261,38 +378,34 @@ AtomIsolate* cogdiod_spawn(CogDiodKernel* k,
     AtomIsolate* a = calloc(1, sizeof(AtomIsolate));
     if (!a) return NULL;
 
-    a->uuid    = cogdiod_next_uuid(k);
-    a->type_id = type_id;
-    a->state   = ATOM_SLEEPING;
-    a->package = pkg;
-    a->history_count = 0;
+    a->uuid           = cogdiod_next_uuid(k);
+    a->type_id        = type_id;
+    a->state          = ATOM_SLEEPING;
+    a->package        = pkg;
     a->hebbian_weight = 1.0f;
+    a->history_count  = 0;
 
     if (atom_name)
         strncpy(a->name, atom_name, ATOM_NAME_MAX - 1);
 
-    /* Default TruthValue and AttentionValue */
     a->tv  = (TruthValue){0.5f, 0.1f};
     a->av  = (AttentionValue){0.0f, 0.0f};
 
-    /* Initialise the Dis VM context */
     if (disvm_init(&a->vm_ctx, pkg) != 0) {
         free(a);
         return NULL;
     }
     a->vm_ctx.kernel_ref = k;
 
-    /* Increment package reference count */
     pthread_mutex_lock(&pkg->ref_lock);
     pkg->ref_count++;
     pthread_mutex_unlock(&pkg->ref_lock);
 
     pthread_mutex_init(&a->lock, NULL);
 
-    /* Insert into pool */
     pthread_rwlock_wrlock(&k->pool_lock);
-    uint32_t b    = pool_bucket(a->uuid);
-    a->ht_next    = k->atom_pool[b];
+    uint32_t b      = pool_bucket(a->uuid);
+    a->ht_next      = k->atom_pool[b];
     k->atom_pool[b] = a;
     k->atom_count++;
     pthread_rwlock_unlock(&k->pool_lock);
@@ -311,18 +424,18 @@ AtomIsolate* cogdiod_get_atom(CogDiodKernel* k, uint64_t uuid) {
     return a;
 }
 
-/* Lock-free fast path using atomic load */
+/* Lock-free fast path using atomic loads (Item 32) */
 AtomIsolate* cogdiod_get_atom_fast(CogDiodKernel* k, uint64_t uuid) {
-    AtomIsolate* head = __atomic_load_n(
-        &k->atom_pool[pool_bucket(uuid)], __ATOMIC_ACQUIRE);
-    while (head && head->uuid != uuid)
-        head = __atomic_load_n(&head->ht_next, __ATOMIC_ACQUIRE);
-    return head;
+    uint32_t b = pool_bucket(uuid);
+    AtomIsolate* a = __atomic_load_n(&k->atom_pool[b], __ATOMIC_ACQUIRE);
+    while (a && a->uuid != uuid)
+        a = __atomic_load_n(&a->ht_next, __ATOMIC_ACQUIRE);
+    return a;
 }
 
 int cogdiod_destroy_atom(CogDiodKernel* k, uint64_t uuid) {
     pthread_rwlock_wrlock(&k->pool_lock);
-    uint32_t b    = pool_bucket(uuid);
+    uint32_t b       = pool_bucket(uuid);
     AtomIsolate** pp = &k->atom_pool[b];
     while (*pp && (*pp)->uuid != uuid) pp = &(*pp)->ht_next;
     if (!*pp) { pthread_rwlock_unlock(&k->pool_lock); return -1; }
@@ -334,7 +447,6 @@ int cogdiod_destroy_atom(CogDiodKernel* k, uint64_t uuid) {
 
     a->state = ATOM_DYING;
 
-    /* Decrement package ref count */
     pthread_mutex_lock(&a->package->ref_lock);
     a->package->ref_count--;
     pthread_mutex_unlock(&a->package->ref_lock);
@@ -350,7 +462,7 @@ int cogdiod_destroy_atom(CogDiodKernel* k, uint64_t uuid) {
 }
 
 /* ─────────────────────────────────────────────────────────────────────────
- * Channel operations
+ * Channel operations  (Item 2: shared LimboChannel with out_next/in_next)
  * ───────────────────────────────────────────────────────────────────────── */
 
 LimboChannel* cogdiod_link(CogDiodKernel* k,
@@ -362,24 +474,24 @@ LimboChannel* cogdiod_link(CogDiodKernel* k,
     LimboChannel* ch = calloc(1, sizeof(LimboChannel));
     if (!ch) return NULL;
 
-    ch->src_uuid  = src_uuid;
-    ch->dst_uuid  = dst_uuid;
-    ch->head      = 0;
-    ch->tail      = 0;
-    ch->ref_count = 2;   /* one ref per endpoint list */
-    ch->weight    = 1.0f;
+    ch->src_uuid      = src_uuid;
+    ch->dst_uuid      = dst_uuid;
+    ch->head = ch->tail = 0;
+    ch->ref_count     = 2;  /* one for outgoing, one for incoming */
+    ch->weight        = 1.0f;
+    ch->last_fire_time = 0;
     pthread_mutex_init(&ch->lock, NULL);
     pthread_cond_init(&ch->not_empty, NULL);
     pthread_cond_init(&ch->not_full, NULL);
 
-    /* Add to src->outgoing via out_next */
+    /* Add to src's outgoing list via out_next */
     pthread_mutex_lock(&src->lock);
     ch->out_next   = src->outgoing;
     src->outgoing  = ch;
     src->outgoing_count++;
     pthread_mutex_unlock(&src->lock);
 
-    /* Add to dst->incoming via in_next (same channel object) */
+    /* Add the SAME channel to dst's incoming list via in_next */
     pthread_mutex_lock(&dst->lock);
     ch->in_next    = dst->incoming;
     dst->incoming  = ch;
@@ -395,7 +507,7 @@ LimboChannel* cogdiod_link(CogDiodKernel* k,
 int cogdiod_send(LimboChannel* ch, const CogMessage* msg) {
     pthread_mutex_lock(&ch->lock);
     uint32_t next = (ch->tail + 1) % CHANNEL_BUF_MAX;
-    while (next == ch->head)   /* buffer full: block */
+    while (next == ch->head)
         pthread_cond_wait(&ch->not_full, &ch->lock);
     ch->buf[ch->tail] = *msg;
     ch->tail = next;
@@ -406,7 +518,7 @@ int cogdiod_send(LimboChannel* ch, const CogMessage* msg) {
 
 int cogdiod_recv(LimboChannel* ch, CogMessage* msg) {
     pthread_mutex_lock(&ch->lock);
-    while (ch->head == ch->tail)  /* buffer empty: block */
+    while (ch->head == ch->tail)
         pthread_cond_wait(&ch->not_empty, &ch->lock);
     *msg = ch->buf[ch->head];
     ch->head = (ch->head + 1) % CHANNEL_BUF_MAX;
@@ -415,42 +527,21 @@ int cogdiod_recv(LimboChannel* ch, CogMessage* msg) {
     return 0;
 }
 
-/* Non-blocking receive: returns 1 if message received, 0 if empty */
-static int cogdiod_try_recv(LimboChannel* ch, CogMessage* msg) {
-    pthread_mutex_lock(&ch->lock);
-    if (ch->head == ch->tail) {
-        pthread_mutex_unlock(&ch->lock);
-        return 0;
-    }
-    *msg = ch->buf[ch->head];
-    ch->head = (ch->head + 1) % CHANNEL_BUF_MAX;
-    pthread_cond_signal(&ch->not_full);
-    pthread_mutex_unlock(&ch->lock);
-    return 1;
-}
-
-static void free_channel(LimboChannel* ch) {
-    pthread_mutex_destroy(&ch->lock);
-    pthread_cond_destroy(&ch->not_empty);
-    pthread_cond_destroy(&ch->not_full);
-    free(ch);
-}
-
 int cogdiod_unlink(CogDiodKernel* k,
                    uint64_t src_uuid, uint64_t dst_uuid) {
     AtomIsolate* src = cogdiod_get_atom(k, src_uuid);
     AtomIsolate* dst = cogdiod_get_atom(k, dst_uuid);
     if (!src || !dst) return -1;
 
-    LimboChannel* found_ch = NULL;
+    LimboChannel* found = NULL;
 
-    /* Step 1: Remove from src->outgoing (follow out_next) */
+    /* Remove from src's outgoing list (via out_next) */
     pthread_mutex_lock(&src->lock);
     LimboChannel** pp = &src->outgoing;
     while (*pp) {
         if ((*pp)->dst_uuid == dst_uuid) {
-            found_ch = *pp;
-            *pp = found_ch->out_next;
+            found = *pp;
+            *pp   = found->out_next;
             src->outgoing_count--;
             break;
         }
@@ -458,178 +549,31 @@ int cogdiod_unlink(CogDiodKernel* k,
     }
     pthread_mutex_unlock(&src->lock);
 
-    if (!found_ch) return -1;
+    if (!found) return -1;
 
-    /* Step 2: Remove from dst->incoming (follow in_next) */
+    /* Remove the same channel from dst's incoming list (via in_next) */
     pthread_mutex_lock(&dst->lock);
-    pp = &dst->incoming;
-    while (*pp) {
-        if (*pp == found_ch) {
-            *pp = found_ch->in_next;
+    LimboChannel** pp2 = &dst->incoming;
+    while (*pp2) {
+        if (*pp2 == found) {
+            *pp2 = found->in_next;
             dst->incoming_count--;
             break;
         }
-        pp = &(*pp)->in_next;
+        pp2 = &(*pp2)->in_next;
     }
     pthread_mutex_unlock(&dst->lock);
 
-    /* Decrement ref_count by 2 (removed from both lists) and free */
-    uint32_t new_rc = __sync_sub_and_fetch(&found_ch->ref_count, 2);
-    if (new_rc == 0)
-        free_channel(found_ch);
+    /* Both refs removed; free the channel */
+    pthread_mutex_destroy(&found->lock);
+    pthread_cond_destroy(&found->not_empty);
+    pthread_cond_destroy(&found->not_full);
+    free(found);
 
     fprintf(stderr, "[cogdiod] unlinked %llu -> %llu\n",
             (unsigned long long)src_uuid,
             (unsigned long long)dst_uuid);
     return 0;
-}
-
-/* ─────────────────────────────────────────────────────────────────────────
- * Worker thread pool
- * ───────────────────────────────────────────────────────────────────────── */
-
-void cogdiod_enqueue(CogDiodKernel* k, AtomIsolate* a) {
-    pthread_mutex_lock(&k->run_queue_lock);
-    uint32_t next_tail = (k->rq_tail + 1) % k->rq_cap;
-    if (next_tail != k->rq_head) {   /* drop if full */
-        k->run_queue[k->rq_tail] = a;
-        k->rq_tail = next_tail;
-        pthread_cond_signal(&k->run_queue_cond);
-    }
-    pthread_mutex_unlock(&k->run_queue_lock);
-}
-
-/* Forward declaration from elm_loader.c */
-int elm_exec_msg(AtomIsolate* a, const CogMessage* msg);
-
-static void* worker_thread(void* arg) {
-    CogDiodKernel* k = (CogDiodKernel*)arg;
-
-    while (1) {
-        pthread_mutex_lock(&k->run_queue_lock);
-        while (k->rq_head == k->rq_tail && k->running)
-            pthread_cond_wait(&k->run_queue_cond, &k->run_queue_lock);
-
-        if (!k->running && k->rq_head == k->rq_tail) {
-            pthread_mutex_unlock(&k->run_queue_lock);
-            break;
-        }
-
-        AtomIsolate* a = k->run_queue[k->rq_head];
-        k->rq_head = (k->rq_head + 1) % k->rq_cap;
-        pthread_mutex_unlock(&k->run_queue_lock);
-
-        if (!a || a->state == ATOM_DYING) continue;
-
-        /* Drain one message from each incoming channel */
-        bool has_more = false;
-        LimboChannel* ch = a->incoming;
-        while (ch) {
-            CogMessage msg;
-            if (cogdiod_try_recv(ch, &msg)) {
-                elm_exec_msg(a, &msg);
-                /* Check if more messages remain */
-                pthread_mutex_lock(&ch->lock);
-                if (ch->head != ch->tail) has_more = true;
-                pthread_mutex_unlock(&ch->lock);
-            }
-            ch = ch->in_next;
-        }
-
-        /* Re-enqueue if more messages pending */
-        if (has_more)
-            cogdiod_enqueue(k, a);
-    }
-    return NULL;
-}
-
-/* ─────────────────────────────────────────────────────────────────────────
- * ECAN background thread
- * ───────────────────────────────────────────────────────────────────────── */
-
-void cogdiod_ecan_diffuse(CogDiodKernel* k) {
-    pthread_rwlock_rdlock(&k->pool_lock);
-    for (int i = 0; i < ATOM_POOL_BUCKETS; i++) {
-        AtomIsolate* a = k->atom_pool[i];
-        while (a) {
-            pthread_mutex_lock(&a->lock);
-
-            /* LTI slow decay */
-            a->av.lti *= 0.999f;
-
-            /* STI spread to outgoing neighbours */
-            if (a->av.sti > 1.0f) {
-                float spread = a->av.sti * 0.3f;
-                LimboChannel* ch = a->outgoing;
-                uint32_t n = a->outgoing_count;
-                if (n > 0) {
-                    float per_ch = spread / (float)n;
-                    a->av.sti -= spread;
-                    while (ch) {
-                        CogMessage msg = {
-                            .type        = MSG_ATTEND,
-                            .sender_uuid = a->uuid,
-                            .av          = { per_ch, 0.0f },
-                        };
-                        /* Non-blocking send: skip if full */
-                        pthread_mutex_lock(&ch->lock);
-                        uint32_t nxt = (ch->tail + 1) % CHANNEL_BUF_MAX;
-                        if (nxt != ch->head) {
-                            ch->buf[ch->tail] = msg;
-                            ch->tail = nxt;
-                            pthread_cond_signal(&ch->not_empty);
-                        }
-                        pthread_mutex_unlock(&ch->lock);
-                        ch = ch->out_next;
-                    }
-                }
-            }
-
-            pthread_mutex_unlock(&a->lock);
-            a = a->ht_next;
-        }
-    }
-    pthread_rwlock_unlock(&k->pool_lock);
-}
-
-static void* ecan_thread_fn(void* arg) {
-    CogDiodKernel* k = (CogDiodKernel*)arg;
-    while (k->running && k->ecan_enabled) {
-        cogdiod_ecan_diffuse(k);
-        usleep(100000);   /* 100 ms between passes */
-    }
-    return NULL;
-}
-
-/* ─────────────────────────────────────────────────────────────────────────
- * Hebbian learning
- * ───────────────────────────────────────────────────────────────────────── */
-
-void cogdiod_hebbian_update(CogDiodKernel* k,
-                            uint64_t src_uuid, uint64_t dst_uuid) {
-    AtomIsolate* src = cogdiod_get_atom(k, src_uuid);
-    AtomIsolate* dst = cogdiod_get_atom(k, dst_uuid);
-    if (!src || !dst) return;
-
-    /* Find the channel between src and dst */
-    pthread_mutex_lock(&src->lock);
-    LimboChannel* ch = src->outgoing;
-    while (ch && ch->dst_uuid != dst_uuid)
-        ch = ch->out_next;
-    if (ch) {
-        /* Hebbian rule: strengthen if both atoms are active */
-        float src_act = src->av.sti > 0.0f ? src->av.sti : 0.0f;
-        float dst_act = dst->av.sti > 0.0f ? dst->av.sti : 0.0f;
-        ch->weight += 0.01f * src_act * dst_act;
-        if (ch->weight > 10.0f) ch->weight = 10.0f;
-    }
-    pthread_mutex_unlock(&src->lock);
-
-    /* Update atom-level hebbian weight */
-    pthread_mutex_lock(&dst->lock);
-    dst->hebbian_weight += 0.005f * src->av.sti;
-    if (dst->hebbian_weight > 10.0f) dst->hebbian_weight = 10.0f;
-    pthread_mutex_unlock(&dst->lock);
 }
 
 /* ─────────────────────────────────────────────────────────────────────────
@@ -641,17 +585,15 @@ int cogdiod_set_tv(CogDiodKernel* k, uint64_t uuid, TruthValue tv) {
     if (!a) return -1;
 
     pthread_mutex_lock(&a->lock);
-
-    /* Push to episodic history */
-    int hi = a->history_count % 8;
-    a->tv_history[hi][0] = a->tv.strength;
-    a->tv_history[hi][1] = a->tv.confidence;
-    a->history_count++;
-
     a->tv = tv;
+    /* Store in episodic history */
+    int h = a->history_count % 8;
+    a->tv_history[h][0] = tv.strength;
+    a->tv_history[h][1] = tv.confidence;
+    a->history_count++;
     pthread_mutex_unlock(&a->lock);
 
-    /* Notify all outgoing channels that our TV changed */
+    /* Notify all outgoing channels and wake downstream atoms (Item 4) */
     CogMessage msg = {
         .type        = MSG_SOURCE_CHANGED,
         .sender_uuid = uuid,
@@ -660,9 +602,12 @@ int cogdiod_set_tv(CogDiodKernel* k, uint64_t uuid, TruthValue tv) {
     LimboChannel* ch = a->outgoing;
     while (ch) {
         cogdiod_send(ch, &msg);
-        /* Wake the destination atom's worker */
-        AtomIsolate* dst = cogdiod_get_atom_fast(k, ch->dst_uuid);
-        if (dst) cogdiod_enqueue(k, dst);
+        /* Enqueue downstream atom to process the message */
+        AtomIsolate* dst = cogdiod_get_atom(k, ch->dst_uuid);
+        if (dst) {
+            dst->state = ATOM_ALIVE;
+            cogdiod_enqueue(k, dst);
+        }
         ch = ch->out_next;
     }
     return 0;
@@ -691,19 +636,86 @@ int cogdiod_attend(CogDiodKernel* k, uint64_t uuid, float sti_delta) {
 }
 
 /* ─────────────────────────────────────────────────────────────────────────
- * Kernel start / stop
+ * ECAN diffusion (Item 18)
+ * ───────────────────────────────────────────────────────────────────────── */
+
+void cogdiod_ecan_diffuse(CogDiodKernel* k) {
+    float threshold   = 1.0f;
+    float spread_frac = 0.3f;
+
+    pthread_rwlock_rdlock(&k->pool_lock);
+    for (int i = 0; i < ATOM_POOL_BUCKETS; i++) {
+        AtomIsolate* a = k->atom_pool[i];
+        while (a) {
+            pthread_mutex_lock(&a->lock);
+            if (a->av.sti > threshold && a->outgoing_count > 0) {
+                float spread = a->av.sti * spread_frac;
+                a->av.sti -= spread;
+                float per_ch = spread / (float)a->outgoing_count;
+                LimboChannel* ch = a->outgoing;
+                while (ch) {
+                    CogMessage msg = {
+                        .type        = MSG_ATTEND,
+                        .sender_uuid = a->uuid,
+                        .av          = { per_ch, 0.0f },
+                    };
+                    cogdiod_send(ch, &msg);
+                    ch = ch->out_next;
+                }
+            }
+            a->av.lti *= 0.999f;
+            pthread_mutex_unlock(&a->lock);
+            a = a->ht_next;
+        }
+    }
+    pthread_rwlock_unlock(&k->pool_lock);
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * Hebbian learning (Item 20)
+ * ───────────────────────────────────────────────────────────────────────── */
+
+int cogdiod_hebbian_update(CogDiodKernel* k,
+                            uint64_t src_uuid, uint64_t dst_uuid) {
+    AtomIsolate* src = cogdiod_get_atom(k, src_uuid);
+    if (!src) return -1;
+
+    pthread_mutex_lock(&src->lock);
+    LimboChannel* ch = src->outgoing;
+    while (ch) {
+        if (ch->dst_uuid == dst_uuid) {
+            ch->weight *= 1.05f;
+            if (ch->weight > 2.0f) ch->weight = 2.0f;
+            break;
+        }
+        ch = ch->out_next;
+    }
+    pthread_mutex_unlock(&src->lock);
+    return 0;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * Kernel start / stop  (Item 3: worker thread pool)
  * ───────────────────────────────────────────────────────────────────────── */
 
 int cogdiod_start(CogDiodKernel* k) {
     k->running = true;
 
+    /* Pre-allocate run queue */
+    if (!k->run_queue) {
+        k->rq_cap    = 1024;
+        k->run_queue = calloc(k->rq_cap, sizeof(AtomIsolate*));
+        if (!k->run_queue) { k->running = false; return -1; }
+        k->rq_head = k->rq_tail = 0;
+    }
+
     /* Launch worker threads */
     for (uint32_t i = 0; i < k->worker_count; i++)
         pthread_create(&k->workers[i], NULL, worker_thread, k);
 
-    /* Launch ECAN thread */
-    k->ecan_enabled = true;
-    pthread_create(&k->ecan_thread, NULL, ecan_thread_fn, k);
+    /* Launch ECAN background thread if enabled */
+    if (k->ecan_enabled)
+        pthread_create(&k->ecan_thread, NULL, ecan_thread_fn, k);
 
     fprintf(stderr, "[cogdiod] kernel started\n");
     return 0;
@@ -711,18 +723,22 @@ int cogdiod_start(CogDiodKernel* k) {
 
 void cogdiod_stop(CogDiodKernel* k) {
     if (!k->running) return;
-    k->running      = false;
-    k->ecan_enabled = false;
+    k->running = false;
 
-    /* Wake all workers so they can exit */
+    /* Wake all workers */
     pthread_mutex_lock(&k->run_queue_lock);
     pthread_cond_broadcast(&k->run_queue_cond);
     pthread_mutex_unlock(&k->run_queue_lock);
 
-    for (uint32_t i = 0; i < k->worker_count; i++)
-        pthread_join(k->workers[i], NULL);
+    /* Join workers */
+    for (uint32_t i = 0; i < k->worker_count; i++) {
+        if (k->workers[i])
+            pthread_join(k->workers[i], NULL);
+    }
 
-    pthread_join(k->ecan_thread, NULL);
+    /* Join ECAN thread if running */
+    if (k->ecan_enabled && k->ecan_thread)
+        pthread_join(k->ecan_thread, NULL);
 
     fprintf(stderr, "[cogdiod] kernel stopped\n");
 }

@@ -164,6 +164,31 @@ Guile's first-class environments enable hypothetical reasoning without mutating 
 
 ---
 
+## LLM Coprocessor — `cogpy/llama.limbo`
+
+CogDiod integrates with [`cogpy/llama.limbo`](https://github.com/cogpy/llama.limbo), a pure-Limbo LLaMA inference engine, as the canonical local-LLM coprocessor for AtomSpace isolates. Atoms of type `llm-coprocessor` are bound to a Limbo `Llama` module instance and respond to `MSG_LLM_INFER` messages by streaming `MSG_LLM_TOKEN` replies.
+
+Full GGUF support (F32 / F16 / BF16 / Q4_0 / Q4_1 / Q5_0 / Q5_1 / Q8_0 / Q8_1), GQA + KV cache + RoPE frequency scaling for LLaMA 3.1+, and the complete sampling suite (greedy, temperature, top-k, top-p, min-p, Mirostat v1+v2) are inherited from `llama.limbo`.
+
+Two transport modes are supported automatically:
+
+- **In-process** — when CogDiod runs under `emu`, inference dispatches directly through `cogdiod_spawn()` onto the `appl/cogllama.b` Limbo wrapper which imports `llama.limbo`'s modules. Zero serialisation overhead.
+- **Subprocess** — when CogDiod runs natively on POSIX, the bridge forks `emu /dis/llama.dis -i` for each attached Atom and proxies prompts / tokens over a pipe pair.
+
+9P namespace (DisTyx):
+
+```
+/ai/llm/<atom-uuid>/model      W   one-shot model path at attach
+/ai/llm/<atom-uuid>/prompt     W   triggers inference
+/ai/llm/<atom-uuid>/response   R   streaming token output
+/ai/llm/<atom-uuid>/params     RW  JSON CogLlmParams (temp, top-k, etc.)
+/ai/llm/<atom-uuid>/stats      R   tokens/sec, total tokens, model meta
+```
+
+See [`cogdiod-llama/README.md`](cogdiod-llama/README.md) for the full integration contract, build instructions, and a quickstart.
+
+---
+
 ## File Extension Convention
 
 CogDiod uses explicit extensions to avoid the historic `.pl` Perl/Prolog collision:

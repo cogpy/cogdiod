@@ -1,65 +1,81 @@
 /*
- * fuzz_distyx.c — LibFuzzer target for DisTyx request dispatch
+ * fuzz_distyx.c — libFuzzer harness for distyx_dispatch path parsing
  *
- * Compile: clang -O1 -fsanitize=fuzzer,address -std=c11 -Iinclude \
- *              -D_GNU_SOURCE -DDISVM_NREGS=16 -DDISVM_STKMAX=4096 \
- *              src/kernel/cogdiod_kernel.c src/kernel/pln.c \
- *              src/kernel/cogdiod_log.c src/p9/distyx.c \
- *              src/elbo/elm_loader.c src/elbo/elbo_compiler.c \
- *              packages/concept_node/concept_node_pkg.c \
- *              packages/evaluation_link/evaluation_link_pkg.c \
- *              packages/implication_link/implication_link_pkg.c \
- *              tests/fuzz_distyx.c -lm -lpthread -o fuzz_distyx
+ * Build (requires clang with libFuzzer):
+ *   clang -fsanitize=fuzzer,address -O1 -std=c11 -Iinclude \
+ *         tests/fuzz_distyx.c src/kernel/cogdiod_kernel.c \
+ *         src/kernel/cogdiod_log.c src/kernel/pln.c \
+ *         src/p9/distyx.c src/elbo/elm_loader.c src/elbo/elbo_compiler.c \
+ *         packages/concept_node/concept_node_pkg.c \
+ *         packages/implication_link/implication_link_pkg.c \
+ *         packages/evaluation_link/evaluation_link_pkg.c \
+ *         -o fuzz_distyx -lpthread -lm
  *
- * Run: ./fuzz_distyx -max_total_time=60
+ * Run:
+ *   ./fuzz_distyx -max_len=512 -runs=100000
  */
-#include <stdint.h>
-#include <stddef.h>
-#include <string.h>
+
 #include "cogdiod.h"
 #include "distyx.h"
+#include <string.h>
+#include <stdlib.h>
 
+/* Global kernel: created once, reused across fuzz iterations */
+static CogDiodKernel* g_kernel = NULL;
+
+/* Package builder forward decls */
 ElmPackage* concept_node_build_package(void);
 
-/* One shared kernel (re-init per fuzz iteration would be too slow) */
-static CogDiodKernel* gk = NULL;
+static void __attribute__((constructor)) init_kernel(void) {
+    g_kernel = cogdiod_create(0, 0);
+    if (!g_kernel) return;
 
-__attribute__((constructor))
-static void fuzz_init(void) {
-    gk = cogdiod_create(0, 1);
+    /* Load the ConceptNode package */
     ElmPackage* cn = concept_node_build_package();
-    pthread_mutex_lock(&gk->pkg_lock);
-    gk->pkg_cache[cn->type_id % PKG_CACHE_BUCKETS] = cn;
-    gk->pkg_count++;
-    pthread_mutex_unlock(&gk->pkg_lock);
-    /* Pre-populate a few atoms so path handlers find real UUIDs */
-    cogdiod_spawn(gk, "ConceptNode", "fuzz_a");
-    cogdiod_spawn(gk, "ConceptNode", "fuzz_b");
+    if (cn) {
+        uint32_t b = cn->type_id % PKG_CACHE_BUCKETS;
+        pthread_mutex_lock(&g_kernel->pkg_lock);
+        cn->next_in_cache = g_kernel->pkg_cache[b];
+        g_kernel->pkg_cache[b] = cn;
+        g_kernel->pkg_count++;
+        pthread_mutex_unlock(&g_kernel->pkg_lock);
+    }
+
+    /* Spawn a couple of atoms so UUIDs 1 and 2 exist */
+    cogdiod_spawn(g_kernel, "ConceptNode", "fuzz_a");
+    cogdiod_spawn(g_kernel, "ConceptNode", "fuzz_b");
 }
 
 int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
-    if (size < 2) return 0;
+    if (!g_kernel || size == 0) return 0;
 
-    DisTyxRequest req = {0};
+    /* Build a null-terminated path from the fuzz input */
+    size_t plen = size < 511 ? size : 511;
+    char path[512];
+    memcpy(path, data, plen);
+    path[plen] = '\0';
+
+    /* Try all operation types */
+    static const int ops[] = {
+        DT_OP_READ, DT_OP_WRITE, DT_OP_CREATE,
+        DT_OP_REMOVE, DT_OP_LINK, DT_OP_STAT,
+    };
+    int op = ops[size % (sizeof(ops)/sizeof(ops[0]))];
+
+    DisTyxRequest  req  = {0};
     DisTyxResponse resp = {0};
+    req.op = op;
+    strncpy(req.path, path, sizeof(req.path) - 1);
 
-    /* First byte selects the operation */
-    req.op = data[0] % 7;  /* 0..6 covers all DT_OP_* values */
-
-    /* Rest is the path (null-terminated within the struct bounds) */
-    size_t plen = size - 1;
-    if (plen >= sizeof(req.path)) plen = sizeof(req.path) - 1;
-    memcpy(req.path, data + 1, plen);
-    req.path[plen] = '\0';
-
-    /* Feed some bytes as write payload */
-    if (size > 16) {
-        size_t dlen = size - 16;
+    /* For write ops: fill buf with fuzz data */
+    if (op == DT_OP_WRITE && size > plen) {
+        size_t dlen = size - plen;
         if (dlen > sizeof(req.buf)) dlen = sizeof(req.buf);
-        memcpy(req.buf, data + 16, dlen);
+        memcpy(req.buf, data + plen, dlen);
         req.buf_len = dlen;
     }
 
-    distyx_dispatch(gk, &req, &resp);
+    /* Should not crash */
+    distyx_dispatch(g_kernel, &req, &resp);
     return 0;
 }

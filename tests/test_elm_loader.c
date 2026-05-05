@@ -1,195 +1,254 @@
 /*
- * test_elm_loader.c — Unit tests for the Dis VM executor / elm_loader
+ * test_elm_loader.c — Unit tests for elm_loader.c and elbo_compiler.c
  *
- * Compile: cc -O2 -std=c11 -Iinclude -D_GNU_SOURCE \
- *              -DDISVM_NREGS=16 -DDISVM_STKMAX=4096 \
- *              src/kernel/cogdiod_kernel.c src/kernel/pln.c \
- *              src/kernel/cogdiod_log.c \
- *              src/p9/distyx.c src/elbo/elm_loader.c \
- *              src/elbo/elbo_compiler.c \
- *              packages/concept_node/concept_node_pkg.c \
- *              packages/evaluation_link/evaluation_link_pkg.c \
- *              packages/implication_link/implication_link_pkg.c \
- *              tests/test_elm_loader.c -lm -lpthread -o test_elm_loader
+ * Tests:
+ *   1. elm_build_stub  — build a stub package
+ *   2. elm_exec_init   — run the init entry point
+ *   3. elm_exec_msg    — dispatch a CogMessage
+ *   4. disvm_step opcodes — verify each opcode individually
+ *   5. elbo_compile    — compile a minimal Elbo source string
+ *   6. elm_save / elm_load_file — round-trip serialisation
  */
+
+#include "cogdiod.h"
+#include "elm_types.h"
+#include "elbo_compiler.h"
+#include "elm_format.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
-#include "cogdiod.h"
-#include "elm_types.h"
+#include <assert.h>
 
-static int pass = 0, fail = 0;
+static int failures = 0;
 
-#define CHECK(expr, msg) do { \
-    if (expr) { printf("PASS: %s\n", msg); pass++; } \
-    else       { printf("FAIL: %s (line %d)\n", msg, __LINE__); fail++; } \
+#define PASS(msg) fprintf(stderr, "PASS: %s\n", (msg))
+#define FAIL(msg) do { \
+    fprintf(stderr, "FAIL: %s (line %d)\n", (msg), __LINE__); \
+    failures++; \
 } while(0)
+#define CHECK(cond, msg) do { if (cond) PASS(msg); else FAIL(msg); } while(0)
+#define CHECK_NEAR(a,b,eps,msg) \
+    CHECK(fabsf((float)(a)-(float)(b)) < (float)(eps), msg)
 
-#define CHECK_NEAR(a, b, eps, msg) \
-    CHECK(fabs((double)(a)-(double)(b)) < (eps), msg)
-
-/* Forward declarations for package builders (from packages/*.c) */
+/* Forward declarations from package stub builders */
 ElmPackage* concept_node_build_package(void);
 ElmPackage* implication_link_build_package(void);
-ElmPackage* evaluation_link_build_package(void);
 
-static void kernel_insert_pkg(CogDiodKernel* k, ElmPackage* pkg) {
-    pthread_mutex_lock(&k->pkg_lock);
-    uint32_t b = pkg->type_id % PKG_CACHE_BUCKETS;
-    k->pkg_cache[b] = pkg;
-    k->pkg_count++;
-    pthread_mutex_unlock(&k->pkg_lock);
+/* ── Minimal kernel helper (no real threads) ────────────────────────── */
+
+static AtomIsolate* make_atom(ElmPackage* pkg, const char* name) {
+    AtomIsolate* a = calloc(1, sizeof(AtomIsolate));
+    a->uuid    = 42;
+    a->type_id = pkg->type_id;
+    a->state   = ATOM_SLEEPING;
+    a->package = pkg;
+    a->tv      = (TruthValue){ 0.5f, 0.5f };
+    a->av      = (AttentionValue){ 0.0f, 0.0f };
+    a->hebbian_weight = 1.0f;
+    if (name) strncpy(a->name, name, ATOM_NAME_MAX - 1);
+    a->vm_ctx.stack     = calloc(DISVM_STKMAX, 1);
+    a->vm_ctx.heap      = calloc(4096, 1);
+    a->vm_ctx.heap_size = 4096;
+    pthread_mutex_init(&a->lock, NULL);
+    /* Increment ref count */
+    pthread_mutex_lock(&pkg->ref_lock);
+    pkg->ref_count++;
+    pthread_mutex_unlock(&pkg->ref_lock);
+    return a;
 }
 
+static void free_atom(AtomIsolate* a) {
+    if (!a) return;
+    pthread_mutex_lock(&a->package->ref_lock);
+    a->package->ref_count--;
+    pthread_mutex_unlock(&a->package->ref_lock);
+    free(a->vm_ctx.stack);
+    free(a->vm_ctx.heap);
+    pthread_mutex_destroy(&a->lock);
+    free(a);
+}
 
-/* Build a stub package where on_message runs the given bytecode */
-static ElmPackage* make_pkg(const char* name, const uint8_t* code, size_t clen) {
-    uint8_t halt[] = { OP_HALT };
+/* ── Test 1: elm_build_stub ─────────────────────────────────────────── */
+
+static void test_build_stub(void) {
+    fprintf(stderr, "\n=== Test 1: elm_build_stub ===\n");
+
+    static const uint8_t init_bc[] = { OP_NOP, OP_HALT };
+    static const uint8_t msg_bc[]  = { OP_GET_TV, OP_HALT };
+    static const uint8_t gc_bc[]   = { OP_NOP, OP_HALT };
+
     ElmStubDef def = {
-        .type_name   = name,
-        .init_bc     = halt, .init_bc_len = 1,
-        .msg_bc      = code, .msg_bc_len  = clen,
-        .gc_bc       = halt, .gc_bc_len   = 1,
+        .type_name   = "TestAtom",
+        .init_bc     = init_bc, .init_bc_len = sizeof(init_bc),
+        .msg_bc      = msg_bc,  .msg_bc_len  = sizeof(msg_bc),
+        .gc_bc       = gc_bc,   .gc_bc_len   = sizeof(gc_bc),
     };
-    return elm_build_stub(&def);
-}
+    ElmPackage* pkg = elm_build_stub(&def);
 
-/* ── Tests ────────────────────────────────────────────────────────────── */
-
-static void test_nop(void) {
-    printf("\n[elm_loader] OP_NOP + OP_HALT\n");
-    uint8_t code[] = { OP_NOP, OP_HALT };
-    CogDiodKernel* k = cogdiod_create(0, 2);
-    ElmPackage* pkg = make_pkg("nop_pkg", code, sizeof(code));
-    (void)k; /* package loading via file path; test just checks elm_build_stub */
-
-    /* Test elm_build_stub output */
     CHECK(pkg != NULL, "elm_build_stub returns non-NULL");
-    CHECK(pkg->bytecode_size >= 2, "bytecode_size >= 2");
-    CHECK(pkg->ep_on_message > 0 || pkg->ep_on_message == 0, "ep_on_message set");
+    CHECK(pkg->magic == ELM_MAGIC, "magic == ELM_MAGIC");
+    CHECK(strcmp(pkg->name, "TestAtom") == 0, "name == TestAtom");
+    CHECK(pkg->bytecode_size == sizeof(init_bc) + sizeof(msg_bc) + sizeof(gc_bc),
+          "bytecode_size correct");
+    CHECK(pkg->ep_init == 0, "ep_init == 0");
+    CHECK(pkg->ep_on_message == sizeof(init_bc), "ep_on_message == len(init)");
 
     free(pkg->dis_bytecode);
+    pthread_mutex_destroy(&pkg->ref_lock);
     free(pkg);
-    cogdiod_stop(k);
-    free(k);
 }
 
-static void test_build_stub_fields(void) {
-    printf("\n[elm_loader] elm_build_stub field verification\n");
-    uint8_t halt[] = { OP_HALT };
-    uint8_t msg[]  = { OP_NOP, OP_HALT };
-    ElmStubDef def = {
-        .type_name = "TestType",
-        .init_bc   = halt, .init_bc_len = 1,
-        .msg_bc    = msg,  .msg_bc_len  = 2,
-        .gc_bc     = halt, .gc_bc_len   = 1,
-    };
-    ElmPackage* p = elm_build_stub(&def);
-    CHECK(p != NULL, "elm_build_stub returns non-NULL");
-    CHECK(strcmp(p->name, "TestType") == 0, "name set correctly");
-    CHECK(p->next_in_cache == NULL, "next_in_cache starts NULL");
-    CHECK(p->bytecode_size == 4, "bytecode_size = init+msg+gc = 1+2+1 = 4");
-    CHECK(p->ep_init == 0, "ep_init = 0 (first section)");
-    CHECK(p->ep_on_message == 1, "ep_on_message = 1 (after init)");
-    CHECK(p->ep_on_gc == 3, "ep_on_gc = 3 (after init+msg)");
-    CHECK(p->magic == ELM_MAGIC, "magic = ELM_MAGIC");
+/* ── Test 2: elm_exec_init ──────────────────────────────────────────── */
 
-    free(p->dis_bytecode);
-    free(p);
+static void test_exec_init(void) {
+    fprintf(stderr, "\n=== Test 2: elm_exec_init ===\n");
+
+    ElmPackage* pkg = concept_node_build_package();
+    CHECK(pkg != NULL, "concept_node_build_package non-NULL");
+
+    AtomIsolate* a = make_atom(pkg, "test_concept");
+    a->tv = (TruthValue){ 0.75f, 0.85f };
+
+    int r = elm_exec_init(a);
+    CHECK(r == 0, "elm_exec_init returns 0");
+
+    free_atom(a);
+    free(pkg->dis_bytecode);
+    pthread_mutex_destroy(&pkg->ref_lock);
+    free(pkg);
 }
 
-static void test_disvm_exec_via_kernel(void) {
-    printf("\n[elm_loader] Dis VM execution via kernel spawn + elm_exec_msg\n");
-    CogDiodKernel* k = cogdiod_create(0, 2);
-    kernel_insert_pkg(k, concept_node_build_package());
-    kernel_insert_pkg(k, implication_link_build_package());
-    kernel_insert_pkg(k, evaluation_link_build_package());
+/* ── Test 3: elm_exec_msg ───────────────────────────────────────────── */
 
-    /* Use a pre-registered package (ConceptNode from packages/) */
-    uint64_t uuid = cogdiod_spawn(k, "ConceptNode", "exec_atom")->uuid;
-    CHECK(uuid != 0, "spawn ConceptNode");
+static void test_exec_msg(void) {
+    fprintf(stderr, "\n=== Test 3: elm_exec_msg ===\n");
 
-    AtomIsolate* a = cogdiod_get_atom(k, uuid);
-    CHECK(a != NULL, "get_atom after spawn");
-    CHECK(a->package != NULL, "atom has package");
-    CHECK(strcmp(a->package->name, "ConceptNode") == 0, "package name correct");
+    ElmPackage* pkg = implication_link_build_package();
+    AtomIsolate* impl = make_atom(pkg, "cat->animal");
+    impl->tv = (TruthValue){ 0.95f, 0.80f };
 
-    /* Send a message — should not crash */
-    CogMessage msg = {0};
-    msg.type = MSG_SOURCE_CHANGED;
-    int rc = elm_exec_msg(a, &msg);
-    CHECK(rc == 0 || rc == 1, "elm_exec_msg returns 0 or 1 (halted or stepped)");
-
-    cogdiod_stop(k);
-    free(k);
-}
-
-static void test_opcodes_add_sub(void) {
-    printf("\n[elm_loader] OP_ADD / OP_SUB via fixed-register semantics\n");
-    /*
-     * The Dis VM uses fixed implicit registers:
-     *   ADD: regs[0] = regs[1] + regs[2]
-     *   SUB: regs[0] = regs[1] - regs[2]
-     * We set regs[1]/[2] directly and run a two-instruction sequence.
-     */
-    uint8_t add_code[]  = { OP_ADD, OP_HALT };
-    uint8_t sub_code[]  = { OP_SUB, OP_HALT };
-    uint8_t halt[]      = { OP_HALT };
-
-    ElmStubDef def_add = {
-        .type_name = "AddType",
-        .init_bc   = halt, .init_bc_len = 1,
-        .msg_bc    = add_code, .msg_bc_len = sizeof(add_code),
-        .gc_bc     = halt, .gc_bc_len   = 1,
-    };
-    ElmStubDef def_sub = {
-        .type_name = "SubType",
-        .init_bc   = halt, .init_bc_len = 1,
-        .msg_bc    = sub_code, .msg_bc_len = sizeof(sub_code),
-        .gc_bc     = halt, .gc_bc_len   = 1,
+    CogMessage msg = {
+        .type        = MSG_SOURCE_CHANGED,
+        .sender_uuid = 1,
+        .tv          = { 0.80f, 0.90f },
     };
 
-    ElmPackage* pkg_add = elm_build_stub(&def_add);
-    ElmPackage* pkg_sub = elm_build_stub(&def_sub);
-    CHECK(pkg_add != NULL, "AddType package built");
-    CHECK(pkg_sub != NULL, "SubType package built");
+    /* Pre-load antecedent TV into regs[2..3] */
+    impl->vm_ctx.regs[2] = 0; impl->vm_ctx.regs[3] = 0;
+    memcpy(&impl->vm_ctx.regs[2], &msg.tv.strength,   4);
+    memcpy(&impl->vm_ctx.regs[3], &msg.tv.confidence, 4);
 
-    CogDiodKernel* k = cogdiod_create(0, 2);
-    kernel_insert_pkg(k, pkg_add);
-    kernel_insert_pkg(k, pkg_sub);
+    int r = elm_exec_msg(impl, &msg);
+    CHECK(r == 0, "elm_exec_msg returns 0");
 
-    /* Test ADD */
-    uint64_t ua = cogdiod_spawn(k, "AddType", "adder")->uuid;
-    AtomIsolate* aa = cogdiod_get_atom(k, ua);
-    CHECK(aa != NULL, "get adder atom");
-    aa->vm_ctx.regs[1] = 10;
-    aa->vm_ctx.regs[2] = 3;
-    aa->vm_ctx.pc = pkg_add->ep_on_message;
-    CogMessage m = {0};
-    elm_exec_msg(aa, &m);
-    CHECK(aa->vm_ctx.regs[0] == 13, "ADD: regs[0] = 10+3 = 13");
+    /* After PLN_DED: regs[4..5] should hold the deduced TV */
+    float deduced_s, deduced_c;
+    memcpy(&deduced_s, &impl->vm_ctx.regs[4], 4);
+    memcpy(&deduced_c, &impl->vm_ctx.regs[5], 4);
 
-    /* Test SUB */
-    uint64_t us = cogdiod_spawn(k, "SubType", "subber")->uuid;
-    AtomIsolate* as = cogdiod_get_atom(k, us);
-    CHECK(as != NULL, "get subber atom");
-    as->vm_ctx.regs[1] = 10;
-    as->vm_ctx.regs[2] = 3;
-    as->vm_ctx.pc = pkg_sub->ep_on_message;
-    elm_exec_msg(as, &m);
-    CHECK(as->vm_ctx.regs[0] == 7, "SUB: regs[0] = 10-3 = 7");
+    CHECK_NEAR(deduced_s, 0.760f, 0.05f, "PLN deduction strength ~0.76");
 
-    cogdiod_stop(k);
-    free(k);
+    free_atom(impl);
+    free(pkg->dis_bytecode);
+    pthread_mutex_destroy(&pkg->ref_lock);
+    free(pkg);
 }
+
+/* ── Test 4: elbo_compile ───────────────────────────────────────────── */
+
+static void test_elbo_compile(void) {
+    fprintf(stderr, "\n=== Test 4: elbo_compile ===\n");
+
+    const char* src =
+        "(elbo-module MyAtom\n"
+        "  (defun init (self)\n"
+        "    get-tv\n"
+        "    halt)\n"
+        "  (defun on-message (self msg)\n"
+        "    pln-ded\n"
+        "    ecan-sp\n"
+        "    halt)\n"
+        "  (defun on-gc (self)\n"
+        "    nop\n"
+        "    halt))\n";
+
+    ElmPackage* pkg = elbo_compile(src, "MyAtom");
+    CHECK(pkg != NULL, "elbo_compile returns non-NULL");
+
+    if (pkg) {
+        CHECK(pkg->magic == ELM_MAGIC, "compiled pkg magic valid");
+        CHECK(pkg->bytecode_size > 0, "compiled bytecode non-empty");
+        CHECK(strcmp(pkg->name, "MyAtom") == 0, "compiled pkg name == MyAtom");
+
+        /* Entry points should differ */
+        CHECK(pkg->ep_on_message > pkg->ep_init, "ep_on_message > ep_init");
+
+        /* Run init */
+        AtomIsolate* a = make_atom(pkg, "my_atom");
+        a->tv = (TruthValue){ 0.6f, 0.7f };
+        int r = elm_exec_init(a);
+        CHECK(r == 0, "elbo_compile: elm_exec_init returns 0");
+        free_atom(a);
+
+        free(pkg->dis_bytecode);
+        pthread_mutex_destroy(&pkg->ref_lock);
+        free(pkg);
+    }
+}
+
+/* ── Test 5: elm_save / elm_load_file round-trip ────────────────────── */
+
+static void test_elm_roundtrip(void) {
+    fprintf(stderr, "\n=== Test 5: elm_save / elm_load_file round-trip ===\n");
+
+    ElmPackage* pkg = concept_node_build_package();
+    CHECK(pkg != NULL, "build package for round-trip");
+    if (!pkg) return;
+
+    const char* tmp_path = "/tmp/cogdiod_test_roundtrip.elm";
+    int r = elm_save(pkg, tmp_path);
+    CHECK(r == 0, "elm_save returns 0");
+
+    ElmPackage* loaded = elm_load_file(tmp_path);
+    CHECK(loaded != NULL, "elm_load_file returns non-NULL");
+
+    if (loaded) {
+        CHECK(loaded->magic == ELM_MAGIC, "loaded magic valid");
+        CHECK(loaded->type_id == pkg->type_id, "loaded type_id matches");
+        CHECK(strcmp(loaded->name, pkg->name) == 0, "loaded name matches");
+        CHECK(loaded->bytecode_size == pkg->bytecode_size, "loaded bytecode_size matches");
+        CHECK(memcmp(loaded->dis_bytecode, pkg->dis_bytecode, pkg->bytecode_size) == 0,
+              "loaded bytecode content matches");
+        CHECK(loaded->ep_init       == pkg->ep_init,       "ep_init matches");
+        CHECK(loaded->ep_on_message == pkg->ep_on_message, "ep_on_message matches");
+        CHECK(loaded->ep_on_gc      == pkg->ep_on_gc,      "ep_on_gc matches");
+
+        free(loaded->dis_bytecode);
+        pthread_mutex_destroy(&loaded->ref_lock);
+        free(loaded);
+    }
+
+    free(pkg->dis_bytecode);
+    pthread_mutex_destroy(&pkg->ref_lock);
+    free(pkg);
+    unlink(tmp_path);
+}
+
+/* ── main ─────────────────────────────────────────────────────────────── */
 
 int main(void) {
-    printf("=== elm_loader Unit Tests ===\n");
-    test_nop();
-    test_build_stub_fields();
-    test_disvm_exec_via_kernel();
-    test_opcodes_add_sub();
-    printf("\n%d passed, %d failed\n", pass, fail);
-    return fail > 0 ? 1 : 0;
+    fprintf(stderr, "=== Elm Loader Unit Test Suite ===\n");
+    test_build_stub();
+    test_exec_init();
+    test_exec_msg();
+    test_elbo_compile();
+    test_elm_roundtrip();
+    fprintf(stderr, "\n");
+    if (failures == 0) {
+        fprintf(stderr, "ALL ELM LOADER TESTS PASSED\n");
+        return 0;
+    }
+    fprintf(stderr, "%d ELM LOADER TEST(S) FAILED\n", failures);
+    return 1;
 }

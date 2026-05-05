@@ -1,23 +1,28 @@
 /*
- * fuzz_elbo.c — LibFuzzer target for the Elbo S-expr compiler
+ * fuzz_elbo.c — libFuzzer harness for the Elbo compiler
  *
- * Compile: clang -O1 -fsanitize=fuzzer,address -std=c11 -Iinclude \
- *              -D_GNU_SOURCE -DDISVM_NREGS=16 -DDISVM_STKMAX=4096 \
- *              src/elbo/elbo_compiler.c src/elbo/elm_loader.c \
- *              src/kernel/cogdiod_kernel.c src/kernel/pln.c \
- *              src/kernel/cogdiod_log.c src/p9/distyx.c \
- *              packages/concept_node/concept_node_pkg.c \
- *              packages/evaluation_link/evaluation_link_pkg.c \
- *              packages/implication_link/implication_link_pkg.c \
- *              tests/fuzz_elbo.c -lm -lpthread -o fuzz_elbo
+ * Feeds arbitrary bytes as Elbo source code to elbo_compile().
+ * Any crash, assertion failure, or memory error is a bug.
  *
- * Run: ./fuzz_elbo -max_total_time=60
+ * Build (requires clang with libFuzzer):
+ *   clang -fsanitize=fuzzer,address -O1 -std=c11 -Iinclude \
+ *         tests/fuzz_elbo.c src/elbo/elbo_compiler.c \
+ *         src/elbo/elm_loader.c src/kernel/cogdiod_log.c \
+ *         src/kernel/pln.c src/kernel/cogdiod_kernel.c \
+ *         packages/concept_node/concept_node_pkg.c \
+ *         packages/implication_link/implication_link_pkg.c \
+ *         packages/evaluation_link/evaluation_link_pkg.c \
+ *         -o fuzz_elbo -lpthread -lm
+ *
+ * Run:
+ *   ./fuzz_elbo -max_len=1024 -runs=500000
  */
-#include <stdint.h>
-#include <stddef.h>
-#include <string.h>
-#include <stdlib.h>
+
 #include "elbo_compiler.h"
+#include "cogdiod.h"
+#include <stdlib.h>
+#include <string.h>
+#include <pthread.h>
 
 int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     if (size == 0) return 0;
@@ -28,11 +33,38 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     memcpy(src, data, size);
     src[size] = '\0';
 
-    ElmPackage* pkg = elbo_compile(src, "FuzzType");
+    /* Compile it — should never crash regardless of input */
+    ElmPackage* pkg = elbo_compile(src, "FuzzAtom");
     if (pkg) {
+        /* Optionally run a few VM steps to exercise the executor */
+        if (pkg->bytecode_size > 0) {
+            AtomIsolate a = {0};
+            a.uuid    = 1;
+            a.package = pkg;
+            a.tv      = (TruthValue){ 0.5f, 0.5f };
+            a.vm_ctx.stack     = calloc(DISVM_STKMAX, 1);
+            a.vm_ctx.heap      = calloc(4096, 1);
+            a.vm_ctx.heap_size = 4096;
+            pthread_mutex_init(&a.lock, NULL);
+            pthread_mutex_lock(&pkg->ref_lock);
+            pkg->ref_count++;
+            pthread_mutex_unlock(&pkg->ref_lock);
+
+            /* Run init — limit steps by using bytecode as-is */
+            elm_exec_init(&a);
+
+            pthread_mutex_lock(&pkg->ref_lock);
+            pkg->ref_count--;
+            pthread_mutex_unlock(&pkg->ref_lock);
+            pthread_mutex_destroy(&a.lock);
+            free(a.vm_ctx.stack);
+            free(a.vm_ctx.heap);
+        }
         free(pkg->dis_bytecode);
+        pthread_mutex_destroy(&pkg->ref_lock);
         free(pkg);
     }
+
     free(src);
     return 0;
 }

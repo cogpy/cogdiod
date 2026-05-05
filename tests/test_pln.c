@@ -1,114 +1,174 @@
 /*
- * test_pln.c — Unit tests for PLN inference rules
+ * test_pln.c — Unit tests for the PLN rule implementations in pln.c
  *
- * Compile: cc -O2 -std=c11 -Iinclude -D_GNU_SOURCE \
- *              -DDISVM_NREGS=16 -DDISVM_STKMAX=4096 \
- *              src/kernel/pln.c tests/test_pln.c -lm -lpthread -o test_pln
+ * Tests all five PLN rules with known input/output values.
+ * Run:  cc -O2 -std=c11 -Iinclude -o test_pln tests/test_pln.c \
+ *          src/kernel/pln.c src/kernel/cogdiod_log.c -lm && ./test_pln
  */
-#include <stdio.h>
-#include <stdlib.h>
-#include <math.h>
+
 #include "cogdiod.h"
+#include <stdio.h>
+#include <math.h>
+#include <string.h>
 
-/* ── Minimal stubs ────────────────────────────────────────────────────── */
+/* ── Helpers ────────────────────────────────────────────────────────── */
 
-static int pass = 0, fail = 0;
+static int failures = 0;
 
-#define CHECK(expr, msg) do { \
-    if (expr) { printf("PASS: %s\n", msg); pass++; } \
-    else       { printf("FAIL: %s (line %d)\n", msg, __LINE__); fail++; } \
+static int near(float a, float b, float eps) {
+    return fabsf(a - b) < eps;
+}
+
+#define PASS(msg) fprintf(stderr, "PASS: %s\n", (msg))
+#define FAIL(msg) do { \
+    fprintf(stderr, "FAIL: %s (line %d)\n", (msg), __LINE__); \
+    failures++; \
 } while(0)
+#define CHECK_NEAR(val, expected, eps, msg) \
+    do { if (near((val),(expected),(eps))) PASS(msg); \
+         else { fprintf(stderr, "FAIL: %s — got %.4f, expected %.4f (eps=%.4f, line %d)\n", \
+                        (msg), (float)(val), (float)(expected), (float)(eps), __LINE__); \
+                failures++; } } while(0)
 
-#define CHECK_NEAR(a, b, eps, msg) \
-    CHECK(fabs((double)(a) - (double)(b)) < (eps), msg)
+/* ── Test 1: pln_deduce ─────────────────────────────────────────────── */
 
-/* ── Test helpers ─────────────────────────────────────────────────────── */
+static void test_pln_deduce(void) {
+    fprintf(stderr, "\n=== Test 1: pln_deduce ===\n");
+    /* pln_deduce(P(B|A), P(A)) → P(B)
+     * s_B = s_AB * s_A = 0.95 * 0.80 = 0.76
+     * c_B = c_AB * c_A * 0.9 = 0.80 * 0.90 * 0.9 = 0.648
+     */
+    TruthValue ab = { 0.95f, 0.80f };
+    TruthValue a  = { 0.80f, 0.90f };
+    TruthValue r  = pln_deduce(ab, a);
+    CHECK_NEAR(r.strength,   0.760f, 0.005f, "pln_deduce strength");
+    CHECK_NEAR(r.confidence, 0.648f, 0.005f, "pln_deduce confidence");
 
-static TruthValue tv(float s, float c) { return (TruthValue){s, c}; }
-
-/* ── Tests ────────────────────────────────────────────────────────────── */
-
-static void test_modus_ponens(void) {
-    printf("\n[PLN] modus_ponens\n");
-    TruthValue ant  = tv(0.8f, 0.9f);   /* P(A) */
-    TruthValue impl = tv(0.95f, 0.8f);  /* P(B|A) */
-    TruthValue res  = pln_modus_ponens(ant, impl);
-
-    /* strength ≈ ant.s * impl.s */
-    CHECK_NEAR(res.strength, 0.8f * 0.95f, 0.001f, "mp: strength = s_ant * s_impl");
-    /* confidence should be less than either input */
-    CHECK(res.confidence < ant.confidence, "mp: confidence < ant.confidence");
-    CHECK(res.confidence < impl.confidence, "mp: confidence < impl.confidence");
-    CHECK(res.confidence > 0, "mp: confidence > 0");
+    /* Edge case: zero antecedent strength */
+    TruthValue zero = { 0.0f, 0.9f };
+    TruthValue r2 = pln_deduce(ab, zero);
+    CHECK_NEAR(r2.strength, 0.0f, 0.001f, "pln_deduce zero antecedent strength");
 }
 
-static void test_abduction(void) {
-    printf("\n[PLN] abduction\n");
-    TruthValue p_a  = tv(0.6f, 0.9f);  /* P(A) */
-    TruthValue p_b  = tv(0.7f, 0.8f);  /* P(B) */
-    TruthValue p_ab = tv(0.9f, 0.7f);  /* P(A|B) */
-    TruthValue res  = pln_abduction(p_a, p_b, p_ab);
+/* ── Test 2: pln_revise ─────────────────────────────────────────────── */
 
-    CHECK(res.strength > 0.0f, "abd: strength > 0");
-    CHECK(res.confidence > 0.0f, "abd: confidence > 0");
-    CHECK(res.strength <= 1.0f, "abd: strength <= 1");
-    CHECK(res.confidence <= 1.0f, "abd: confidence <= 1");
+static void test_pln_revise(void) {
+    fprintf(stderr, "\n=== Test 2: pln_revise ===\n");
+    /* tv1 = (0.70, 0.60), tv2 = (0.80, 0.40)
+     * total_c = 1.00
+     * s = (0.70*0.60 + 0.80*0.40) / 1.00 = (0.42 + 0.32) / 1.00 = 0.74
+     * c = 1.00 / (1.00 + 1.00) = 0.5
+     */
+    TruthValue tv1 = { 0.70f, 0.60f };
+    TruthValue tv2 = { 0.80f, 0.40f };
+    TruthValue r   = pln_revise(tv1, tv2);
+    CHECK_NEAR(r.strength,   0.74f, 0.005f, "pln_revise strength");
+    CHECK_NEAR(r.confidence, 0.50f, 0.005f, "pln_revise confidence");
+
+    /* Edge case: both zero confidence */
+    TruthValue zero_c1 = { 0.5f, 0.0f };
+    TruthValue zero_c2 = { 0.9f, 0.0f };
+    TruthValue r2 = pln_revise(zero_c1, zero_c2);
+    CHECK_NEAR(r2.strength, 0.5f, 0.001f, "pln_revise zero confidence preserves tv1");
 }
 
-static void test_induction(void) {
-    printf("\n[PLN] induction\n");
-    TruthValue p_a  = tv(0.6f, 0.9f);  /* P(A) */
-    TruthValue p_ba = tv(0.8f, 0.7f);  /* P(B|A) */
-    TruthValue res  = pln_induction(p_a, p_ba);
+/* ── Test 3: pln_modus_ponens ────────────────────────────────────────── */
 
-    CHECK(res.strength > 0.0f, "ind: strength > 0");
-    CHECK(res.confidence > 0.0f, "ind: confidence > 0");
-    /* Induction is weaker than implication */
-    CHECK(res.confidence < p_ba.confidence, "ind: confidence < impl confidence");
+static void test_pln_modus_ponens(void) {
+    fprintf(stderr, "\n=== Test 3: pln_modus_ponens ===\n");
+    /* Same formula as pln_deduce: P(B) = P(A→B) * P(A) */
+    TruthValue a  = { 0.80f, 0.90f };
+    TruthValue ab = { 0.95f, 0.80f };
+    TruthValue r  = pln_modus_ponens(a, ab);
+    CHECK_NEAR(r.strength,   0.760f, 0.005f, "pln_modus_ponens strength");
+    CHECK_NEAR(r.confidence, 0.648f, 0.005f, "pln_modus_ponens confidence");
 }
 
-static void test_temporal_deduce(void) {
-    printf("\n[PLN] temporal_deduce\n");
-    TruthValue tv1 = tv(0.9f, 0.8f);   /* ab */
-    TruthValue tv2 = tv(1.0f, 1.0f);   /* a  (full confidence so s = ab.s) */
-    float decay = 0.95f;
-    float steps = 3.0f;
+/* ── Test 4: pln_abduction ───────────────────────────────────────────── */
 
-    /* signature: pln_temporal_deduce(ab, a, steps, decay) */
-    TruthValue res = pln_temporal_deduce(tv1, tv2, steps, decay);
+static void test_pln_abduction(void) {
+    fprintf(stderr, "\n=== Test 4: pln_abduction ===\n");
+    /* P(B→A) ≈ P(A→B) * P(A) / P(B), clamped to [0,1]
+     * a=(0.8,0.9), b=(0.7,0.8), ab=(0.9,0.85)
+     * s = 0.9 * 0.8 / 0.7 = 1.028 → clamped to 1.0
+     * c = 0.85 * 0.9 * 0.8 * 0.85 = 0.5202
+     */
+    TruthValue a  = { 0.80f, 0.90f };
+    TruthValue b  = { 0.70f, 0.80f };
+    TruthValue ab = { 0.90f, 0.85f };
+    TruthValue r  = pln_abduction(a, b, ab);
+    CHECK_NEAR(r.strength,   1.00f, 0.001f, "pln_abduction strength clamped at 1.0");
+    /* confidence > 0 */
+    if (r.confidence > 0.0f)
+        PASS("pln_abduction confidence > 0");
+    else
+        FAIL("pln_abduction confidence should be > 0");
 
-    /* strength = ab.s * a.s */
-    CHECK_NEAR(res.strength, tv1.strength * tv2.strength, 0.001f, "tmp: strength = ab.s * a.s");
-    /* confidence decayed by decay^steps */
-    float factor = decay * decay * decay;
-    CHECK(res.confidence < tv1.confidence, "tmp: confidence decayed below ab.confidence");
-    CHECK_NEAR(res.confidence, tv1.confidence * tv2.confidence * 0.9f * factor, 0.001f,
-               "tmp: confidence = ab.c * a.c * 0.9 * decay^3");
+    /* Edge case: b.strength near zero → result (0,0) */
+    TruthValue bzero = { 1e-10f, 0.5f };
+    TruthValue r2 = pln_abduction(a, bzero, ab);
+    CHECK_NEAR(r2.strength,   0.0f, 0.001f, "pln_abduction zero b strength");
+    CHECK_NEAR(r2.confidence, 0.0f, 0.001f, "pln_abduction zero b confidence");
 }
 
-static void test_boundary_conditions(void) {
-    printf("\n[PLN] boundary conditions\n");
-    TruthValue zero = tv(0.0f, 0.0f);
-    TruthValue one  = tv(1.0f, 1.0f);
+/* ── Test 5: pln_induction ───────────────────────────────────────────── */
 
-    TruthValue r1 = pln_modus_ponens(zero, one);
-    CHECK_NEAR(r1.strength, 0.0f, 0.001f, "mp(0,1): strength = 0");
+static void test_pln_induction(void) {
+    fprintf(stderr, "\n=== Test 5: pln_induction ===\n");
+    /* s_AB = s_B / s_A = 0.60 / 0.80 = 0.75
+     * c    = c_A * c_B * 0.8 = 0.90 * 0.70 * 0.8 = 0.504
+     */
+    TruthValue a = { 0.80f, 0.90f };
+    TruthValue b = { 0.60f, 0.70f };
+    TruthValue r = pln_induction(a, b);
+    CHECK_NEAR(r.strength,   0.75f, 0.005f, "pln_induction strength");
+    CHECK_NEAR(r.confidence, 0.504f, 0.005f, "pln_induction confidence");
 
-    TruthValue r2 = pln_modus_ponens(one, one);
-    CHECK_NEAR(r2.strength, 1.0f, 0.001f, "mp(1,1): strength = 1");
-
-    TruthValue r3 = pln_temporal_deduce(one, one, 0.0f, 1.0f);
-    /* steps=0, decay=1.0 → decay^0=1, confidence = 1*1*0.9*1 = 0.9 */
-    CHECK_NEAR(r3.confidence, 0.9f, 0.001f, "tmp(1,1,steps=0,decay=1): conf=0.9");
+    /* Edge case: s_B > s_A → result clamped to 1 */
+    TruthValue a_small = { 0.3f, 0.8f };
+    TruthValue b_large = { 0.9f, 0.7f };
+    TruthValue r2 = pln_induction(a_small, b_large);
+    CHECK_NEAR(r2.strength, 1.0f, 0.001f, "pln_induction strength clamped to 1");
 }
+
+/* ── Test 6: pln_temporal_deduce ─────────────────────────────────────── */
+
+static void test_pln_temporal_deduce(void) {
+    fprintf(stderr, "\n=== Test 6: pln_temporal_deduce ===\n");
+    /* Base deduction result, then decayed by decay^steps */
+    TruthValue ab = { 0.95f, 0.80f };
+    TruthValue a  = { 0.80f, 0.90f };
+    float decay   = 0.90f;
+    float steps   = 3.0f;
+    TruthValue r  = pln_temporal_deduce(ab, a, steps, decay);
+
+    /* base confidence = 0.80 * 0.90 * 0.9 = 0.648
+     * after decay^3   = 0.648 * 0.729 = 0.4724
+     */
+    CHECK_NEAR(r.strength,   0.760f, 0.005f, "pln_temporal_deduce strength unchanged");
+    CHECK_NEAR(r.confidence, 0.472f, 0.010f, "pln_temporal_deduce confidence decayed");
+
+    /* zero steps = no decay */
+    TruthValue r2 = pln_temporal_deduce(ab, a, 0.0f, decay);
+    CHECK_NEAR(r2.confidence, 0.648f, 0.005f, "pln_temporal_deduce zero steps = no decay");
+}
+
+/* ── main ─────────────────────────────────────────────────────────────── */
 
 int main(void) {
-    printf("=== PLN Unit Tests ===\n");
-    test_modus_ponens();
-    test_abduction();
-    test_induction();
-    test_temporal_deduce();
-    test_boundary_conditions();
-    printf("\n%d passed, %d failed\n", pass, fail);
-    return fail > 0 ? 1 : 0;
+    fprintf(stderr, "=== PLN Unit Test Suite ===\n");
+    test_pln_deduce();
+    test_pln_revise();
+    test_pln_modus_ponens();
+    test_pln_abduction();
+    test_pln_induction();
+    test_pln_temporal_deduce();
+    fprintf(stderr, "\n");
+    if (failures == 0) {
+        fprintf(stderr, "ALL PLN TESTS PASSED\n");
+        return 0;
+    } else {
+        fprintf(stderr, "%d PLN TEST(S) FAILED\n", failures);
+        return 1;
+    }
 }

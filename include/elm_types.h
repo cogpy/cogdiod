@@ -46,11 +46,9 @@ typedef enum {
     OP_PLN_DED= 0x44,
     OP_PLN_REV= 0x45,
     OP_ECAN_SP= 0x46,
-
-    /* Extended PLN rules */
-    OP_PLN_ABD= 0x50,
-    OP_PLN_IND= 0x51,
-    OP_PLN_TMP= 0x52,
+    OP_PLN_ABD= 0x47,  /* Phase 5 Item 17: Abduction */
+    OP_PLN_IND= 0x48,  /* Phase 5 Item 17: Induction */
+    OP_PLN_TMP= 0x49,  /* Phase 5 Item 17: Temporal Deduction */
 
     /* Halt */
     OP_HALT   = 0xFF,
