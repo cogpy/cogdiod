@@ -47,6 +47,11 @@ typedef enum {
     OP_PLN_REV= 0x45,
     OP_ECAN_SP= 0x46,
 
+    /* Extended PLN rules */
+    OP_PLN_ABD= 0x50,
+    OP_PLN_IND= 0x51,
+    OP_PLN_TMP= 0x52,
+
     /* Halt */
     OP_HALT   = 0xFF,
 } DisOpcode;

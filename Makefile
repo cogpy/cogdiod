@@ -10,6 +10,7 @@ CFLAGS  = -Wall -Wextra -O2 -std=c11 -pthread \
 LDFLAGS = -lpthread -lm
 
 SRCS = src/kernel/cogdiod_kernel.c \
+       src/kernel/pln.c \
        src/p9/distyx.c \
        src/elbo/elm_loader.c \
        packages/concept_node/concept_node_pkg.c \
