@@ -1,23 +1,38 @@
 /*
  * pln.c — Probabilistic Logic Networks rule implementations
  *
- * These are the "public" PLN API functions declared in cogdiod.h.
- * The static versions in elm_loader.c handle opcode dispatch;
- * these are callable from C (e.g., the bridge and language bindings).
+ * Canonical home for all PLN inference functions declared in cogdiod.h.
+ * Both elm_loader.c (via extern) and the public bridge/language bindings
+ * link against these definitions.
+ *
+ * Phase 5 (Item 17) verified formulas:
+ *   - Deduction (Modus Ponens)
+ *   - Revision  (Bayesian update)
+ *   - Abduction (P(A|B) from P(A), P(B), P(B|A))
+ *   - Induction (P(B|A) from observations)
+ *   - Temporal Deduction (with exponential decay)
  */
 
 #include "cogdiod.h"
 #include <math.h>
 
-/* All implementations delegate to the versions in elm_loader.c via
- * the PLN rule functions declared in cogdiod.h.  We provide them
- * here as extern definitions so external translation units can link
- * against them without pulling in the full elm_loader object.     */
+TruthValue pln_deduce(TruthValue ab, TruthValue a) {
+    float s = ab.strength * a.strength;
+    float c = ab.confidence * a.confidence * 0.9f;
+    return (TruthValue){ s, c };
+}
+
+TruthValue pln_revise(TruthValue tv1, TruthValue tv2) {
+    float total_c = tv1.confidence + tv2.confidence;
+    if (total_c < 1e-6f) return tv1;
+    float s = (tv1.strength * tv1.confidence +
+               tv2.strength * tv2.confidence) / total_c;
+    float c = total_c / (total_c + 1.0f);
+    return (TruthValue){ s, c };
+}
 
 TruthValue pln_modus_ponens(TruthValue a, TruthValue a_implies_b) {
-    float s = a_implies_b.strength * a.strength;
-    float c = a_implies_b.confidence * a.confidence * 0.9f;
-    return (TruthValue){ s, c };
+    return pln_deduce(a_implies_b, a);
 }
 
 TruthValue pln_abduction(TruthValue a, TruthValue b, TruthValue ab) {
@@ -37,9 +52,8 @@ TruthValue pln_induction(TruthValue a, TruthValue b) {
 
 TruthValue pln_temporal_deduce(TruthValue ab, TruthValue a,
                                 float time_steps, float decay) {
-    float s = ab.strength * a.strength;
-    float c = ab.confidence * a.confidence * 0.9f;
+    TruthValue base = pln_deduce(ab, a);
     float factor = powf(decay, time_steps);
-    c *= factor;
-    return (TruthValue){ s, c };
+    base.confidence *= factor;
+    return base;
 }
