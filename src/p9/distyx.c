@@ -1,3 +1,226 @@
+/*
+ * distyx.c — DisTyx: the cognitive 9P/Styx protocol layer for CogDiod
+ *
+ * DisTyx extends 9P2000.L with five cognitive operations:
+ *
+ *   SPAWN   — Tlcreate on /ai/atoms/<type>/<name>  → new AtomIsolate
+ *   DESTROY — Tunlinkat                             → GC the isolate
+ *   READ_TV — Tread on /ai/atoms/<uuid>/tv          → TruthValue bytes
+ *   WRITE_TV— Twrite on /ai/atoms/<uuid>/tv         → update TruthValue
+ *   LINK    — Tlink  /ai/atoms/<src>/out/<dst>      → LimboChannel
+ *   ATTEND  — Twrite on /ai/atoms/<uuid>/sti        → STI delta
+ *   INFER   — Twrite on /ai/atoms/<uuid>/infer      → trigger inference
+ *
+ * The namespace layout served by DisTyx:
+ *
+ *   /ai/
+ *     atoms/
+ *       <type>/               ← directory of all atoms of this type
+ *         <name_or_uuid>/
+ *           tv                ← TruthValue (8 bytes: 2x float32)
+ *           av                ← AttentionValue (8 bytes: 2x float32)
+ *           ctl               ← control file: "infer\n", "gc\n"
+ *           in/               ← incoming channels (read-only listing)
+ *           out/              ← outgoing channels (write to link)
+ *     packages/
+ *       <type>.elm            ← package bytecode (read to fetch)
+ *     stats                   ← kernel statistics (JSON)
+ */
+
+#include "cogdiod.h"
+#include "distyx.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * 9P message types (subset of 9P2000.L used by DisTyx)
+ * ───────────────────────────────────────────────────────────────────────── */
+
+#define P9_TVERSION  100
+#define P9_RVERSION  101
+#define P9_TATTACH   104
+#define P9_RATTACH   105
+#define P9_TERROR    106
+#define P9_RERROR    107
+#define P9_TWALK     110
+#define P9_RWALK     111
+#define P9_TLOPEN    112
+#define P9_RLOPEN    113
+#define P9_TLCREATE  114
+#define P9_RLCREATE  115
+#define P9_TREAD     116
+#define P9_RREAD     117
+#define P9_TWRITE    118
+#define P9_RWRITE    119
+#define P9_TCLUNK    120
+#define P9_RCLUNK    121
+#define P9_TREMOVE   122
+#define P9_RREMOVE   123
+#define P9_TGETATTR  124
+#define P9_RGETATTR  125
+#define P9_TSETATTR  126
+#define P9_RSETATTR  127
+#define P9_TLINK     170
+#define P9_RLINK     171
+
+/* DisTyx cognitive extensions (above standard 9P range) */
+#define DT_TINFER    200
+#define DT_RINFER    201
+#define DT_TATTEND   202
+#define DT_RATTEND   203
+#define DT_TSPAWN    204
+#define DT_RSPAWN    205
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * Minimal 9P wire format helpers
+ * ───────────────────────────────────────────────────────────────────────── */
+
+typedef struct {
+    uint32_t size;
+    uint8_t  type;
+    uint16_t tag;
+    uint8_t  data[DISTYX_MSIZE];
+} P9Msg;
+
+static void p9_put_u16(uint8_t* buf, uint16_t v) {
+    buf[0] = v & 0xFF; buf[1] = (v >> 8) & 0xFF;
+}
+static void p9_put_u32(uint8_t* buf, uint32_t v) {
+    buf[0] = v & 0xFF; buf[1] = (v >> 8) & 0xFF;
+    buf[2] = (v >> 16) & 0xFF; buf[3] = (v >> 24) & 0xFF;
+}
+static uint32_t p9_get_u32(const uint8_t* buf) {
+    return (uint32_t)buf[0] | ((uint32_t)buf[1] << 8) |
+           ((uint32_t)buf[2] << 16) | ((uint32_t)buf[3] << 24);
+}
+static uint16_t p9_get_u16(const uint8_t* buf) {
+    return (uint16_t)buf[0] | ((uint16_t)buf[1] << 8);
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * DisTyx path parser
+ *
+ * Parses /ai/atoms/<type>/<name>/<file> into its components.
+ * ───────────────────────────────────────────────────────────────────────── */
+
+typedef struct {
+    char segment[8][64];   /* path segments */
+    int  depth;
+} DisTyxPath;
+
+static int distyx_parse_path(const char* path, DisTyxPath* p) {
+    p->depth = 0;
+    char tmp[512];
+    strncpy(tmp, path, 511);
+    char* tok = strtok(tmp, "/");
+    while (tok && p->depth < 8) {
+        strncpy(p->segment[p->depth++], tok, 63);
+        tok = strtok(NULL, "/");
+    }
+    return p->depth;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * DisTyx request handlers
+ * ───────────────────────────────────────────────────────────────────────── */
+
+/*
+ * Handle a Tlcreate on /ai/atoms/<type>/<name>
+ * → spawns a new AtomIsolate and returns its UUID as the Qid.
+ */
+static int distyx_handle_create(CogDiodKernel* k,
+                                const char* type_name,
+                                const char* atom_name,
+                                uint64_t* out_uuid) {
+    AtomIsolate* a = cogdiod_spawn(k, type_name, atom_name);
+    if (!a) return -1;
+    *out_uuid = a->uuid;
+    return 0;
+}
+
+/*
+ * Handle a Tread on /ai/atoms/<uuid>/tv
+ * → returns 8 bytes: [strength:f32][confidence:f32]
+ */
+static int distyx_handle_read_tv(CogDiodKernel* k,
+                                 uint64_t uuid,
+                                 uint8_t* out_buf, size_t* out_len) {
+    TruthValue tv = cogdiod_get_tv(k, uuid);
+    memcpy(out_buf,     &tv.strength,   4);
+    memcpy(out_buf + 4, &tv.confidence, 4);
+    *out_len = 8;
+    return 0;
+}
+
+/*
+ * Handle a Twrite on /ai/atoms/<uuid>/tv
+ * → parses 8 bytes and updates the TruthValue.
+ */
+static int distyx_handle_write_tv(CogDiodKernel* k,
+                                  uint64_t uuid,
+                                  const uint8_t* buf, size_t len) {
+    if (len < 8) return -1;
+    TruthValue tv;
+    memcpy(&tv.strength,   buf,     4);
+    memcpy(&tv.confidence, buf + 4, 4);
+    return cogdiod_set_tv(k, uuid, tv);
+}
+
+/*
+ * Handle a Twrite on /ai/atoms/<uuid>/sti
+ * → parses 4 bytes (float32) and calls cogdiod_attend.
+ */
+static int distyx_handle_attend(CogDiodKernel* k,
+                                uint64_t uuid,
+                                const uint8_t* buf, size_t len) {
+    if (len < 4) return -1;
+    float delta;
+    memcpy(&delta, buf, 4);
+    return cogdiod_attend(k, uuid, delta);
+}
+
+/*
+ * Handle a Tlink on /ai/atoms/<src_uuid>/out/<dst_uuid>
+ * → creates a LimboChannel between the two atoms.
+ */
+static int distyx_handle_link(CogDiodKernel* k,
+                              uint64_t src_uuid, uint64_t dst_uuid) {
+    LimboChannel* ch = cogdiod_link(k, src_uuid, dst_uuid);
+    return ch ? 0 : -1;
+}
+
+/*
+ * Handle a Twrite on /ai/atoms/<uuid>/ctl with "infer\n"
+ * → sends MSG_INFER to all outgoing channels of the atom.
+ */
+static int distyx_handle_infer(CogDiodKernel* k, uint64_t uuid) {
+    AtomIsolate* a = cogdiod_get_atom(k, uuid);
+    if (!a) return -1;
+
+    CogMessage msg = {
+        .type        = MSG_INFER,
+        .sender_uuid = uuid,
+    };
+    LimboChannel* ch = a->outgoing;
+    while (ch) {
+        cogdiod_send(ch, &msg);
+        ch = ch->next;
+    }
+    return 0;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * DisTyx stats serialiser
+ * ───────────────────────────────────────────────────────────────────────── */
+
+
 /* ─────────────────────────────────────────────────────────────────────────
  * DisTyx stats serialiser
  * ───────────────────────────────────────────────────────────────────────── */
