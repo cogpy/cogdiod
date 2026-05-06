@@ -246,6 +246,51 @@ static int distyx_stats(CogDiodKernel* k, char* buf, size_t max) {
 static int distyx_handle_list_atoms(CogDiodKernel* k,
                                     uint8_t* buf, size_t* out_len) {
     char tmp[DISTYX_MSIZE];
+    size_t pos = 0;
+    int n = snprintf(tmp + pos, sizeof(tmp) - pos, "[");
+    if (n < 0 || (size_t)n >= sizeof(tmp) - pos) {
+        return -1;
+    }
+    pos += (size_t)n;
+
+    pthread_rwlock_rdlock(&k->pool_lock);
+    int first = 1;
+    int truncated = 0;
+    for (int i = 0; i < ATOM_POOL_BUCKETS && !truncated; i++) {
+        AtomIsolate* a = k->atom_pool[i];
+        while (a) {
+            size_t avail;
+            if (pos >= sizeof(tmp)) {
+                truncated = 1;
+                break;
+            }
+
+            if (!first) {
+                avail = sizeof(tmp) - pos;
+                n = snprintf(tmp + pos, avail, ",");
+                if (n < 0) {
+                    pthread_rwlock_unlock(&k->pool_lock);
+                    return -1;
+                }
+                if ((size_t)n >= avail) {
+                    truncated = 1;
+                    break;
+                }
+                pos += (size_t)n;
+            }
+
+            avail = sizeof(tmp) - pos;
+            n = snprintf(tmp + pos, avail, "%llu",
+                         (unsigned long long)a->uuid);
+            if (n < 0) {
+                pthread_rwlock_unlock(&k->pool_lock);
+                return -1;
+            }
+            if ((size_t)n >= avail) {
+                truncated = 1;
+                break;
+            }
+            pos += (size_t)n;
     int  pos = 0;
     pos += snprintf(tmp + pos, sizeof(tmp) - (size_t)pos, "[");
 
@@ -263,6 +308,15 @@ static int distyx_handle_list_atoms(CogDiodKernel* k,
     }
     pthread_rwlock_unlock(&k->pool_lock);
 
+    if (pos < sizeof(tmp)) {
+        n = snprintf(tmp + pos, sizeof(tmp) - pos, "]\n");
+        if (n >= 0 && (size_t)n < sizeof(tmp) - pos) {
+            pos += (size_t)n;
+        }
+    }
+
+    memcpy(buf, tmp, pos);
+    *out_len = pos;
     pos += snprintf(tmp + pos, sizeof(tmp) - (size_t)pos, "]\n");
     size_t len = (size_t)pos;
     if (len > DISTYX_MSIZE) len = DISTYX_MSIZE;
@@ -338,19 +392,70 @@ static int distyx_handle_read_links(CogDiodKernel* k,
 
     char tmp[DISTYX_MSIZE];
     int pos = 0;
+    int n = 0;
+    size_t rem = sizeof(tmp);
+
+    n = snprintf(tmp + pos, rem, "[");
+    if (n < 0) return -1;
+    if ((size_t)n >= rem) {
+        pos = (int)sizeof(tmp) - 1;
+        tmp[pos] = '\0';
+    } else {
+        pos += n;
+    }
     pos += snprintf(tmp + pos, sizeof(tmp) - (size_t)pos, "[");
 
     pthread_mutex_lock(&a->lock);
     int first = 1;
     LimboChannel* ch = a->outgoing;
     while (ch) {
-        if (!first) pos += snprintf(tmp + pos, sizeof(tmp) - (size_t)pos, ",");
-        pos += snprintf(tmp + pos, sizeof(tmp) - (size_t)pos,
-                        "%llu", (unsigned long long)ch->dst_uuid);
+        if (pos >= (int)sizeof(tmp)) break;
+        rem = sizeof(tmp) - (size_t)pos;
+
+        if (!first) {
+            n = snprintf(tmp + pos, rem, ",");
+            if (n < 0) {
+                pthread_mutex_unlock(&a->lock);
+                return -1;
+            }
+            if ((size_t)n >= rem) {
+                pos = (int)sizeof(tmp) - 1;
+                tmp[pos] = '\0';
+                break;
+            }
+            pos += n;
+            rem = sizeof(tmp) - (size_t)pos;
+        }
+
+        n = snprintf(tmp + pos, rem, "%llu", (unsigned long long)ch->dst_uuid);
+        if (n < 0) {
+            pthread_mutex_unlock(&a->lock);
+            return -1;
+        }
+        if ((size_t)n >= rem) {
+            pos = (int)sizeof(tmp) - 1;
+            tmp[pos] = '\0';
+            break;
+        }
+        pos += n;
+
+        first = 0;
         first = 0;
         ch = ch->out_next;
     }
     pthread_mutex_unlock(&a->lock);
+
+    if (pos < (int)sizeof(tmp)) {
+        rem = sizeof(tmp) - (size_t)pos;
+        n = snprintf(tmp + pos, rem, "]\n");
+        if (n < 0) return -1;
+        if ((size_t)n >= rem) {
+            pos = (int)sizeof(tmp) - 1;
+            tmp[pos] = '\0';
+        } else {
+            pos += n;
+        }
+    }
 
     pos += snprintf(tmp + pos, sizeof(tmp) - (size_t)pos, "]\n");
     size_t len = (size_t)pos;

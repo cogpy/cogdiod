@@ -45,3 +45,5 @@ typedef struct {
 int distyx_dispatch(CogDiodKernel* k,
                     const DisTyxRequest* req,
                     DisTyxResponse* resp);
+
+int distyx_start_tcp(CogDiodKernel* k, uint16_t port);
