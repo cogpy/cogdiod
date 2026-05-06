@@ -291,17 +291,7 @@ static int distyx_handle_list_atoms(CogDiodKernel* k,
                 break;
             }
             pos += (size_t)n;
-    int  pos = 0;
-    pos += snprintf(tmp + pos, sizeof(tmp) - (size_t)pos, "[");
 
-    pthread_rwlock_rdlock(&k->pool_lock);
-    int first = 1;
-    for (int i = 0; i < ATOM_POOL_BUCKETS; i++) {
-        AtomIsolate* a = k->atom_pool[i];
-        while (a) {
-            if (!first) pos += snprintf(tmp + pos, sizeof(tmp) - (size_t)pos, ",");
-            pos += snprintf(tmp + pos, sizeof(tmp) - (size_t)pos,
-                            "%llu", (unsigned long long)a->uuid);
             first = 0;
             a = a->ht_next;
         }
@@ -317,11 +307,6 @@ static int distyx_handle_list_atoms(CogDiodKernel* k,
 
     memcpy(buf, tmp, pos);
     *out_len = pos;
-    pos += snprintf(tmp + pos, sizeof(tmp) - (size_t)pos, "]\n");
-    size_t len = (size_t)pos;
-    if (len > DISTYX_MSIZE) len = DISTYX_MSIZE;
-    memcpy(buf, tmp, len);
-    *out_len = len;
     return 0;
 }
 
@@ -403,7 +388,6 @@ static int distyx_handle_read_links(CogDiodKernel* k,
     } else {
         pos += n;
     }
-    pos += snprintf(tmp + pos, sizeof(tmp) - (size_t)pos, "[");
 
     pthread_mutex_lock(&a->lock);
     int first = 1;
@@ -440,7 +424,6 @@ static int distyx_handle_read_links(CogDiodKernel* k,
         pos += n;
 
         first = 0;
-        first = 0;
         ch = ch->out_next;
     }
     pthread_mutex_unlock(&a->lock);
@@ -457,11 +440,8 @@ static int distyx_handle_read_links(CogDiodKernel* k,
         }
     }
 
-    pos += snprintf(tmp + pos, sizeof(tmp) - (size_t)pos, "]\n");
-    size_t len = (size_t)pos;
-    if (len > DISTYX_MSIZE) len = DISTYX_MSIZE;
-    memcpy(buf, tmp, len);
-    *out_len = len;
+    memcpy(buf, tmp, (size_t)pos);
+    *out_len = (size_t)pos;
     return 0;
 }
 
