@@ -144,9 +144,13 @@ sub introspect {
 sub uuid   { return $_[0]->{uuid}   }
 sub bridge { return $_[0]->{bridge} }
 
-# ── CogDiod::Agent — base class for autonomous cognitive agents ───────────
+# ── CogDiod::SimpleAgent — minimal cognitive agent ────────────────────────
 #
-# Any package that inherits from CogDiod::Agent gets:
+# A lightweight, AUTOLOAD-free agent that wraps the bridge with a small
+# imperative API. Use this when you want explicit perceive/act/infer
+# methods without the rich AUTOLOAD-based dispatch of CogDiod::Agent.
+#
+# Any package that inherits from CogDiod::SimpleAgent gets:
 #   - A bridge connection
 #   - An atom store (name → uuid)
 #   - perceive($name, $s, $c) — spawn/update a belief atom
@@ -154,7 +158,7 @@ sub bridge { return $_[0]->{bridge} }
 #   - infer($ant_uuid, $impl_uuid) — PLN modus ponens via bridge
 #   - snapshot() — full state as JSON-decoded hashref
 
-package CogDiod::Agent;
+package CogDiod::SimpleAgent;
 
 sub new {
     my ($class, %opts) = @_;
