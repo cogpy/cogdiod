@@ -83,6 +83,10 @@
       ((number?  v) (format #f "~a" v))
       ((boolean? v) (if v "true" "false"))
       ((string?  v) (format #f "\"~a\"" v))
+      ;; Dotted pair (e.g. TruthValue created via (cons s c)) — `map`
+      ;; would error on a non-proper list, so handle car/cdr directly.
+      ((and (pair? v) (not (list? v)))
+       (format #f "[~a,~a]" (val->json (car v)) (val->json (cdr v))))
       ((pair?    v) (format #f "[~a]"
                       (string-join (map val->json v) ",")))
       (else          (format #f "\"~a\"" v))))
