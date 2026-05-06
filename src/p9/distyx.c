@@ -439,9 +439,7 @@ static int distyx_handle_read_links(CogDiodKernel* k,
         }
         pos += n;
 
-        if (!first) pos += snprintf(tmp + pos, sizeof(tmp) - (size_t)pos, ",");
-        pos += snprintf(tmp + pos, sizeof(tmp) - (size_t)pos,
-                        "%llu", (unsigned long long)ch->dst_uuid);
+        first = 0;
         first = 0;
         ch = ch->out_next;
     }
