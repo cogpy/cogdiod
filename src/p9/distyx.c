@@ -376,21 +376,69 @@ static int distyx_handle_read_links(CogDiodKernel* k,
 
     char tmp[DISTYX_MSIZE];
     int pos = 0;
-    pos += snprintf(tmp + pos, sizeof(tmp) - (size_t)pos, "[");
+    int n = 0;
+    size_t rem = sizeof(tmp);
+
+    n = snprintf(tmp + pos, rem, "[");
+    if (n < 0) return -1;
+    if ((size_t)n >= rem) {
+        pos = (int)sizeof(tmp) - 1;
+        tmp[pos] = '\0';
+    } else {
+        pos += n;
+    }
 
     pthread_mutex_lock(&a->lock);
     int first = 1;
     LimboChannel* ch = a->outgoing;
     while (ch) {
-        if (!first) pos += snprintf(tmp + pos, sizeof(tmp) - (size_t)pos, ",");
-        pos += snprintf(tmp + pos, sizeof(tmp) - (size_t)pos,
-                        "%llu", (unsigned long long)ch->dst_uuid);
+        if (pos >= (int)sizeof(tmp)) break;
+        rem = sizeof(tmp) - (size_t)pos;
+
+        if (!first) {
+            n = snprintf(tmp + pos, rem, ",");
+            if (n < 0) {
+                pthread_mutex_unlock(&a->lock);
+                return -1;
+            }
+            if ((size_t)n >= rem) {
+                pos = (int)sizeof(tmp) - 1;
+                tmp[pos] = '\0';
+                break;
+            }
+            pos += n;
+            rem = sizeof(tmp) - (size_t)pos;
+        }
+
+        n = snprintf(tmp + pos, rem, "%llu", (unsigned long long)ch->dst_uuid);
+        if (n < 0) {
+            pthread_mutex_unlock(&a->lock);
+            return -1;
+        }
+        if ((size_t)n >= rem) {
+            pos = (int)sizeof(tmp) - 1;
+            tmp[pos] = '\0';
+            break;
+        }
+        pos += n;
+
         first = 0;
         ch = ch->out_next;
     }
     pthread_mutex_unlock(&a->lock);
 
-    pos += snprintf(tmp + pos, sizeof(tmp) - (size_t)pos, "]\n");
+    if (pos < (int)sizeof(tmp)) {
+        rem = sizeof(tmp) - (size_t)pos;
+        n = snprintf(tmp + pos, rem, "]\n");
+        if (n < 0) return -1;
+        if ((size_t)n >= rem) {
+            pos = (int)sizeof(tmp) - 1;
+            tmp[pos] = '\0';
+        } else {
+            pos += n;
+        }
+    }
+
     size_t len = (size_t)pos;
     if (len > DISTYX_MSIZE) len = DISTYX_MSIZE;
     memcpy(buf, tmp, len);
