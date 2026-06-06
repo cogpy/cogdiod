@@ -291,34 +291,22 @@ static int distyx_handle_list_atoms(CogDiodKernel* k,
                 break;
             }
             pos += (size_t)n;
-    int  pos = 0;
-    pos += snprintf(tmp + pos, sizeof(tmp) - (size_t)pos, "[");
 
-    pthread_rwlock_rdlock(&k->pool_lock);
-    int first = 1;
-    for (int i = 0; i < ATOM_POOL_BUCKETS; i++) {
-        AtomIsolate* a = k->atom_pool[i];
-        while (a) {
-            if (!first) pos += snprintf(tmp + pos, sizeof(tmp) - (size_t)pos, ",");
-            pos += snprintf(tmp + pos, sizeof(tmp) - (size_t)pos,
-                            "%llu", (unsigned long long)a->uuid);
             first = 0;
             a = a->ht_next;
         }
     }
     pthread_rwlock_unlock(&k->pool_lock);
 
-    if (pos < sizeof(tmp)) {
+    /* Close the JSON array */
+    if (!truncated && pos < sizeof(tmp)) {
         n = snprintf(tmp + pos, sizeof(tmp) - pos, "]\n");
         if (n >= 0 && (size_t)n < sizeof(tmp) - pos) {
             pos += (size_t)n;
         }
     }
 
-    memcpy(buf, tmp, pos);
-    *out_len = pos;
-    pos += snprintf(tmp + pos, sizeof(tmp) - (size_t)pos, "]\n");
-    size_t len = (size_t)pos;
+    size_t len = pos;
     if (len > DISTYX_MSIZE) len = DISTYX_MSIZE;
     memcpy(buf, tmp, len);
     *out_len = len;
