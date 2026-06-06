@@ -10,6 +10,7 @@ SRCS = src/kernel/cogdiod_kernel.c \
        src/elbo/elm_loader.c \
        src/elbo/elbo_compiler.c \
        src/llm/cogdiod_llm.c \
+       src/pm/unify.c \
        packages/concept_node/concept_node_pkg.c \
        packages/evaluation_link/evaluation_link_pkg.c \
        packages/implication_link/implication_link_pkg.c \

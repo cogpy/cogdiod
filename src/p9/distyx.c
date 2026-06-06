@@ -699,6 +699,21 @@ int distyx_dispatch(CogDiodKernel* k,
         }
     }
 
+    /* /ai/query/<bind_link_uuid> — pattern matching (Phase 3.4) */
+    if (p.depth == 3 && strcmp(p.segment[1], "query") == 0) {
+        if (req->op == DT_OP_READ) {
+            uint64_t bind_uuid = strtoull(p.segment[2], NULL, 10);
+            /* Simple pattern match - just return the match count for now */
+            /* Full implementation would return JSON bindings */
+            int matches = 0; /* cogdiod_match would be called here */
+            int n = snprintf((char*)resp->buf, sizeof(resp->buf),
+                             "{\"bind_link\":%llu,\"matches\":%d}\n",
+                             (unsigned long long)bind_uuid, matches);
+            resp->buf_len = (size_t)(n > 0 ? n : 0);
+            return 0;
+        }
+    }
+
     snprintf(resp->errmsg, 127, "unknown path: %s", req->path);
     resp->status = -1;
     return -1;
