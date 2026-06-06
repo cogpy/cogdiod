@@ -306,6 +306,9 @@ TruthValue     cogdiod_get_tv_history(CogDiodKernel* k, uint64_t uuid, int versi
 /* Hebbian learning */
 int            cogdiod_hebbian_update(CogDiodKernel* k,
                                       uint64_t src_uuid, uint64_t dst_uuid);
+void           cogdiod_hebbian_decay_all(CogDiodKernel* k);
+int            cogdiod_prune_weak_channels(CogDiodKernel* k, float threshold);
+void           cogdiod_set_ecan_params(CogDiodKernel* k, float spread, float decay, float rent);
 
 /* PLN rules (defined in pln.c) */
 TruthValue     pln_deduce(TruthValue ab, TruthValue a);

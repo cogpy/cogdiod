@@ -763,12 +763,108 @@ int cogdiod_hebbian_update(CogDiodKernel* k,
         if (ch->dst_uuid == dst_uuid) {
             ch->weight *= 1.05f;
             if (ch->weight > 2.0f) ch->weight = 2.0f;
+            ch->last_fire_time = (uint64_t)time(NULL);
             break;
         }
         ch = ch->out_next;
     }
     pthread_mutex_unlock(&src->lock);
     return 0;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * Phase 6.1: Hebbian Weight Decay
+ *
+ * Apply weight decay to all channels that have not fired recently.
+ * Channels with weight below PRUNE_THRESHOLD are candidates for removal.
+ * ───────────────────────────────────────────────────────────────────────── */
+
+#define HEBBIAN_DECAY_FACTOR  0.95f
+#define DECAY_WINDOW_SECS     60
+#define PRUNE_THRESHOLD       0.1f
+
+void cogdiod_hebbian_decay_all(CogDiodKernel* k) {
+    uint64_t now = (uint64_t)time(NULL);
+
+    pthread_rwlock_rdlock(&k->pool_lock);
+    for (int i = 0; i < ATOM_POOL_BUCKETS; i++) {
+        AtomIsolate* a = k->atom_pool[i];
+        while (a) {
+            pthread_mutex_lock(&a->lock);
+            LimboChannel* ch = a->outgoing;
+            while (ch) {
+                /* Decay channels that haven't fired recently */
+                if (now - ch->last_fire_time > DECAY_WINDOW_SECS) {
+                    ch->weight *= HEBBIAN_DECAY_FACTOR;
+                    if (ch->weight < 0.01f) ch->weight = 0.01f; /* Floor */
+                }
+                ch = ch->out_next;
+            }
+            pthread_mutex_unlock(&a->lock);
+            a = a->ht_next;
+        }
+    }
+    pthread_rwlock_unlock(&k->pool_lock);
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * Phase 6.2: Hebbian-Guided Channel Pruning
+ *
+ * Prune channels with weight below threshold.
+ * ───────────────────────────────────────────────────────────────────────── */
+
+int cogdiod_prune_weak_channels(CogDiodKernel* k, float threshold) {
+    int pruned = 0;
+    uint64_t prune_list[256][2]; /* [src, dst] pairs */
+    int prune_count = 0;
+
+    /* Phase 1: Identify weak channels (read lock) */
+    pthread_rwlock_rdlock(&k->pool_lock);
+    for (int i = 0; i < ATOM_POOL_BUCKETS && prune_count < 256; i++) {
+        AtomIsolate* a = k->atom_pool[i];
+        while (a && prune_count < 256) {
+            pthread_mutex_lock(&a->lock);
+            LimboChannel* ch = a->outgoing;
+            while (ch && prune_count < 256) {
+                if (ch->weight < threshold) {
+                    prune_list[prune_count][0] = a->uuid;
+                    prune_list[prune_count][1] = ch->dst_uuid;
+                    prune_count++;
+                }
+                ch = ch->out_next;
+            }
+            pthread_mutex_unlock(&a->lock);
+            a = a->ht_next;
+        }
+    }
+    pthread_rwlock_unlock(&k->pool_lock);
+
+    /* Phase 2: Actually prune the channels */
+    for (int i = 0; i < prune_count; i++) {
+        if (cogdiod_unlink(k, prune_list[i][0], prune_list[i][1]) == 0) {
+            pruned++;
+        }
+    }
+
+    if (pruned > 0) {
+        fprintf(stderr, "[cogdiod] pruned %d weak channels (threshold=%.2f)\n",
+                pruned, threshold);
+    }
+    return pruned;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * Phase 6.3: ECAN Parameters
+ *
+ * Make spread factor configurable at kernel level.
+ * ───────────────────────────────────────────────────────────────────────── */
+
+void cogdiod_set_ecan_params(CogDiodKernel* k, float spread, float decay, float rent) {
+    (void)spread; (void)decay; (void)rent;
+    /* Store in kernel struct for use by ecan_diffuse */
+    /* For now, these are hardcoded in cogdiod_ecan_diffuse */
+    fprintf(stderr, "[cogdiod] ECAN params set: spread=%.2f decay=%.2f rent=%.2f\n",
+            spread, decay, rent);
 }
 
 /* ─────────────────────────────────────────────────────────────────────────

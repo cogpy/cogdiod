@@ -428,7 +428,6 @@ static int distyx_handle_read_links(CogDiodKernel* k,
         pos += n;
 
         first = 0;
-        first = 0;
         ch = ch->out_next;
     }
     pthread_mutex_unlock(&a->lock);
