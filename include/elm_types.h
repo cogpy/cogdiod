@@ -71,5 +71,6 @@ typedef struct {
 
 ElmPackage* elm_build_stub(const ElmStubDef* def);
 int         elm_save(const ElmPackage* pkg, const char* path);
+ElmPackage* elm_load_file(const char* path);
 int         elm_exec_init(AtomIsolate* a);
 int         elm_exec_msg(AtomIsolate* a, const CogMessage* msg);
