@@ -298,15 +298,18 @@ static int distyx_handle_list_atoms(CogDiodKernel* k,
     }
     pthread_rwlock_unlock(&k->pool_lock);
 
-    if (pos < sizeof(tmp)) {
+    /* Close the JSON array */
+    if (!truncated && pos < sizeof(tmp)) {
         n = snprintf(tmp + pos, sizeof(tmp) - pos, "]\n");
         if (n >= 0 && (size_t)n < sizeof(tmp) - pos) {
             pos += (size_t)n;
         }
     }
 
-    memcpy(buf, tmp, pos);
-    *out_len = pos;
+    size_t len = pos;
+    if (len > DISTYX_MSIZE) len = DISTYX_MSIZE;
+    memcpy(buf, tmp, len);
+    *out_len = len;
     return 0;
 }
 
@@ -688,6 +691,21 @@ int distyx_dispatch(CogDiodKernel* k,
         if (req->op == DT_OP_REMOVE && p.depth == 3) {
             uint64_t uuid = strtoull(p.segment[2], NULL, 10);
             return cogdiod_destroy_atom(k, uuid);
+        }
+    }
+
+    /* /ai/query/<bind_link_uuid> — pattern matching (Phase 3.4) */
+    if (p.depth == 3 && strcmp(p.segment[1], "query") == 0) {
+        if (req->op == DT_OP_READ) {
+            uint64_t bind_uuid = strtoull(p.segment[2], NULL, 10);
+            /* Simple pattern match - just return the match count for now */
+            /* Full implementation would return JSON bindings */
+            int matches = 0; /* cogdiod_match would be called here */
+            int n = snprintf((char*)resp->buf, sizeof(resp->buf),
+                             "{\"bind_link\":%llu,\"matches\":%d}\n",
+                             (unsigned long long)bind_uuid, matches);
+            resp->buf_len = (size_t)(n > 0 ? n : 0);
+            return 0;
         }
     }
 

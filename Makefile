@@ -10,9 +10,22 @@ SRCS = src/kernel/cogdiod_kernel.c \
        src/elbo/elm_loader.c \
        src/elbo/elbo_compiler.c \
        src/llm/cogdiod_llm.c \
+       src/pm/unify.c \
        packages/concept_node/concept_node_pkg.c \
        packages/evaluation_link/evaluation_link_pkg.c \
-       packages/implication_link/implication_link_pkg.c
+       packages/implication_link/implication_link_pkg.c \
+       packages/predicate_node/predicate_node_pkg.c \
+       packages/number_node/number_node_pkg.c \
+       packages/variable_node/variable_node_pkg.c \
+       packages/inheritance_link/inheritance_link_pkg.c \
+       packages/similarity_link/similarity_link_pkg.c \
+       packages/member_link/member_link_pkg.c \
+       packages/and_link/and_link_pkg.c \
+       packages/or_link/or_link_pkg.c \
+       packages/not_link/not_link_pkg.c \
+       packages/equivalence_link/equivalence_link_pkg.c \
+       packages/list_link/list_link_pkg.c \
+       packages/bind_link/bind_link_pkg.c
 
 TEST_SRC     = tests/test_cogdiod.c
 UNIT_TESTS   = tests/test_pln.c tests/test_elm_loader.c \
