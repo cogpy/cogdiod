@@ -21,6 +21,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <math.h>
+
+/* Maximum size for source files (1MB) */
+#define ELBO_MAX_SOURCE_SIZE (1024 * 1024)
+
+/* Maximum number of clauses in a cond expression */
+#define ELBO_MAX_COND_CLAUSES 64
 
 /* ─────────────────────────────────────────────────────────────────────────
  * Bytecode emitter
@@ -274,12 +281,16 @@ static int compile_list(Lexer* l, ByteBuffer* b) {
         /* (cond (test1 expr1) (test2 expr2) ... (else exprN))
          * Compiles to a chain of if-then-else
          */
-        size_t jump_to_end[64];
+        size_t jump_to_end[ELBO_MAX_COND_CLAUSES];
         int jump_count = 0;
         
         lex_skip(l);
         while (l->pos < l->len && l->src[l->pos] == '(') {
             l->pos++; /* consume '(' */
+            lex_skip(l);
+            
+            /* Save position to check for 'else' without consuming */
+            size_t saved_pos = l->pos;
             char clause_head[64];
             lex_atom(l, clause_head, sizeof(clause_head));
             
@@ -293,10 +304,9 @@ static int compile_list(Lexer* l, ByteBuffer* b) {
                 if (l->pos < l->len && l->src[l->pos] == ')') l->pos++;
                 break;
             } else {
-                /* Regular clause: test first, then body */
-                /* The clause_head was the test - we need to reparse */
-                /* For simplicity, emit NOP for the test token read */
-                bb_emit(b, OP_NOP);
+                /* Regular clause: restore position and compile test expr */
+                l->pos = saved_pos;
+                compile_expr(l, b);
                 
                 bb_emit(b, OP_JEQ);
                 size_t next_clause = bb_offset(b);
@@ -310,10 +320,13 @@ static int compile_list(Lexer* l, ByteBuffer* b) {
                 }
                 
                 /* Jump to end after body */
-                if (jump_count < 64) {
+                if (jump_count < ELBO_MAX_COND_CLAUSES) {
                     bb_emit(b, OP_JMP);
                     jump_to_end[jump_count++] = bb_offset(b);
                     bb_emit_u64(b, 0);
+                } else {
+                    fprintf(stderr, "[elbo] warning: cond exceeds %d clauses\n", 
+                            ELBO_MAX_COND_CLAUSES);
                 }
                 
                 bb_patch_u64(b, next_clause, bb_offset(b));
@@ -459,8 +472,8 @@ static int compile_expr(Lexer* l, ByteBuffer* b) {
     lex_atom(l, atom, sizeof(atom));
     
     if (is_number(atom)) {
-        /* Emit LOAD opcode with float constant */
-        float f = (float)strtod(atom, NULL);
+        /* Emit LOAD opcode with float constant (use strtof for precision) */
+        float f = strtof(atom, NULL);
         bb_emit(b, OP_LOAD);
         bb_emit_float(b, f);
     } else {
@@ -536,9 +549,10 @@ int elbo_compile_file(const char* src_path, const char* out_path) {
     long fsize = ftell(f);
     fseek(f, 0, SEEK_SET);
     
-    if (fsize <= 0 || fsize > 1024*1024) {
+    if (fsize <= 0 || fsize > ELBO_MAX_SOURCE_SIZE) {
         fclose(f);
-        fprintf(stderr, "[elbo] invalid source file size: %ld\n", fsize);
+        fprintf(stderr, "[elbo] invalid source file size: %ld (max: %d)\n", 
+                fsize, ELBO_MAX_SOURCE_SIZE);
         return -1;
     }
     
