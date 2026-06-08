@@ -69,12 +69,15 @@
 
 (close-port bridge-port)
 
-;; ── cogdiod-env->json: serialize a Guile environment to JSON ─────────────
+;; ── cogdiod-alist->json: serialize a binding alist to JSON ───────────────
 ;;
 ;; Converts an association list (env as alist) to a JSON object string.
 ;; Each binding (name . value) is serialized based on the value type.
+;;
+;; Distinct from cogdiod-env->json (defined above), which takes a
+;; cogdiod-env object and is the canonical serializer used by callers.
 
-(define (cogdiod-env->json env-alist)
+(define (cogdiod-alist->json env-alist)
   (define (val->json v)
     (cond
       ((number?  v) (format #f "~a" v))
@@ -93,12 +96,15 @@
       ",")
     "}"))
 
-;; ── cogdiod-send-env: send a Guile env snapshot to the bridge ────────────
+;; ── cogdiod-sync-alist-to-bridge: sync an alist of bindings to the bridge ──
 ;;
 ;; Takes an alist of cognitive bindings and sends them as a series of
 ;; spawn/set_tv calls so the bridge mirrors the Guile environment state.
+;;
+;; Distinct from cogdiod-send-env (defined above), which transmits a
+;; pre-serialized env JSON over a bridge port to a remote atom.
 
-(define (cogdiod-send-env bridge-spawn-fn bridge-settv-fn env-alist)
+(define (cogdiod-sync-alist-to-bridge bridge-spawn-fn bridge-settv-fn env-alist)
   "Sync env-alist to the bridge. bridge-spawn-fn takes (type name s c) → uuid.
    bridge-settv-fn takes (uuid s c) to update an existing atom."
   (for-each

@@ -391,7 +391,6 @@ static int distyx_handle_read_links(CogDiodKernel* k,
     } else {
         pos += n;
     }
-    pos += snprintf(tmp + pos, sizeof(tmp) - (size_t)pos, "[");
 
     pthread_mutex_lock(&a->lock);
     int first = 1;
@@ -444,11 +443,8 @@ static int distyx_handle_read_links(CogDiodKernel* k,
         }
     }
 
-    pos += snprintf(tmp + pos, sizeof(tmp) - (size_t)pos, "]\n");
-    size_t len = (size_t)pos;
-    if (len > DISTYX_MSIZE) len = DISTYX_MSIZE;
-    memcpy(buf, tmp, len);
-    *out_len = len;
+    memcpy(buf, tmp, (size_t)pos);
+    *out_len = (size_t)pos;
     return 0;
 }
 
