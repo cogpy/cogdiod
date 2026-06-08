@@ -487,9 +487,13 @@ static int compile_expr(Lexer* l, ByteBuffer* b) {
         char* endptr;
         errno = 0;
         float f = strtof(atom, &endptr);
-        if (errno != 0 || endptr == atom) {
+        /* Primary failure: no digits consumed. Also warn on ERANGE for overflow. */
+        if (endptr == atom) {
             fprintf(stderr, "[elbo] warning: invalid float literal '%s'\n", atom);
             f = 0.0f;
+        } else if (errno == ERANGE) {
+            fprintf(stderr, "[elbo] warning: float overflow/underflow '%s'\n", atom);
+            /* f will be HUGE_VALF or 0.0, use it anyway */
         }
         bb_emit(b, OP_LOAD);
         bb_emit_float(b, f);
@@ -576,11 +580,18 @@ int elbo_compile_file(const char* src_path, const char* out_path) {
     char* source = malloc((size_t)fsize + 1);
     if (!source) {
         fclose(f);
+        fprintf(stderr, "[elbo] failed to allocate %ld bytes for source\n", fsize);
         return -1;
     }
     
     size_t read_bytes = fread(source, 1, (size_t)fsize, f);
     fclose(f);
+    
+    if (read_bytes < (size_t)fsize) {
+        fprintf(stderr, "[elbo] short read: got %zu of %ld bytes\n", read_bytes, fsize);
+        free(source);
+        return -1;
+    }
     source[read_bytes] = '\0';
     
     /* Derive type name from filename */
