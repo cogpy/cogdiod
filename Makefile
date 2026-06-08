@@ -25,7 +25,14 @@ SRCS = src/kernel/cogdiod_kernel.c \
        packages/not_link/not_link_pkg.c \
        packages/equivalence_link/equivalence_link_pkg.c \
        packages/list_link/list_link_pkg.c \
-       packages/bind_link/bind_link_pkg.c
+       packages/bind_link/bind_link_pkg.c \
+       packages/execution_link/execution_link_pkg.c \
+       packages/context_link/context_link_pkg.c \
+       packages/predictive_implication_link/predictive_implication_link_pkg.c \
+       packages/at_time_link/at_time_link_pkg.c \
+       packages/time_node/time_node_pkg.c \
+       packages/grounded_schema_node/grounded_schema_node_pkg.c \
+       packages/grounded_predicate_node/grounded_predicate_node_pkg.c
 
 TEST_SRC     = tests/test_cogdiod.c
 UNIT_TESTS   = tests/test_pln.c tests/test_elm_loader.c \

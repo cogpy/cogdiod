@@ -1,12 +1,16 @@
 /*
  * elbo_compiler.c — Elbo S-expression → Dis bytecode compiler (Item 11)
  *
- * Grammar (subset):
- *   expr  ::= atom | '(' head expr* ')'
+ * Grammar (extended for Phase 4):
+ *   expr  ::= atom | number | '(' head expr* ')'
  *   head  ::= 'concept' | 'implication' | 'evaluation'
  *           | 'pln-ded' | 'pln-rev' | 'pln-abd' | 'pln-ind' | 'pln-tmp'
  *           | 'set-tv' | 'get-tv' | 'set-sti' | 'get-sti'
  *           | 'send' | 'recv' | 'spawn' | 'halt'
+ *           | 'if' | 'cond' | 'when' | 'unless'      (Phase 4.2: conditionals)
+ *           | 'let' | 'define'                        (Phase 4.1: bindings)
+ *           | 'fn' | 'defun'                          (Phase 4.4: lambdas)
+ *   number ::= [0-9]+\.?[0-9]* (Phase 4.5: float literals)
  */
 
 #include "elbo_compiler.h"
@@ -17,6 +21,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <math.h>
+#include <errno.h>
+
+/* Maximum size for source files (1MB) */
+#define ELBO_MAX_SOURCE_SIZE (1024 * 1024)
+
+/* Maximum number of clauses in a cond expression */
+#define ELBO_MAX_COND_CLAUSES 64
 
 /* ─────────────────────────────────────────────────────────────────────────
  * Bytecode emitter
@@ -49,6 +61,27 @@ static int bb_emit_u64(ByteBuffer* b, uint64_t v) {
     for (int i = 0; i < 8; i++)
         b->buf[b->size++] = (v >> (i * 8)) & 0xFF;
     return 0;
+}
+
+/* Phase 4.5: Emit float as 4-byte IEEE 754 (little-endian) */
+static int bb_emit_float(ByteBuffer* b, float f) {
+    if (bb_ensure(b, 4) != 0) return -1;
+    union { float f; uint32_t u; } conv;
+    conv.f = f;
+    for (int i = 0; i < 4; i++)
+        b->buf[b->size++] = (conv.u >> (i * 8)) & 0xFF;
+    return 0;
+}
+
+/* Get current bytecode offset (for backpatching) */
+static size_t bb_offset(ByteBuffer* b) {
+    return b->size;
+}
+
+/* Backpatch a u64 target address at a given offset */
+static void bb_patch_u64(ByteBuffer* b, size_t offset, uint64_t value) {
+    for (int i = 0; i < 8; i++)
+        b->buf[offset + i] = (value >> (i * 8)) & 0xFF;
 }
 
 /* ─────────────────────────────────────────────────────────────────────────
@@ -85,6 +118,27 @@ static int lex_atom(Lexer* l, char* out, size_t out_max) {
     }
     out[n] = '\0';
     return (int)n;
+}
+
+/* Phase 4.5: Check if a token looks like a number (int or float) */
+static int is_number(const char* s) {
+    if (!s || !*s) return 0;
+    /* Optional leading sign */
+    if (*s == '-' || *s == '+') s++;
+    if (!*s) return 0;
+    int has_digit = 0;
+    while (isdigit((unsigned char)*s)) { s++; has_digit = 1; }
+    if (*s == '.') {
+        s++;
+        while (isdigit((unsigned char)*s)) { s++; has_digit = 1; }
+    }
+    /* Optional exponent */
+    if (*s == 'e' || *s == 'E') {
+        s++;
+        if (*s == '-' || *s == '+') s++;
+        while (isdigit((unsigned char)*s)) s++;
+    }
+    return has_digit && (*s == '\0');
 }
 
 /* ─────────────────────────────────────────────────────────────────────────
@@ -168,8 +222,246 @@ static int compile_list(Lexer* l, ByteBuffer* b) {
         bb_emit(b, OP_PUSH);
     } else if (strcmp(head, "pop") == 0) {
         bb_emit(b, OP_POP);
+    }
+    /* ─────────────────────────────────────────────────────────────────────
+     * Phase 4.2: Conditionals (if / cond / when / unless)
+     * ───────────────────────────────────────────────────────────────────── */
+    else if (strcmp(head, "if") == 0) {
+        /* (if test then else)
+         * Compile: test → JEQ else_label → then → JMP end_label → else → end
+         */
+        compile_expr(l, b);              /* compile test */
+        bb_emit(b, OP_JEQ);              /* jump if false (regs[0] == 0) */
+        size_t else_addr = bb_offset(b);
+        bb_emit_u64(b, 0);               /* placeholder for else address */
+        
+        compile_expr(l, b);              /* compile then branch */
+        bb_emit(b, OP_JMP);              /* jump to end */
+        size_t end_addr = bb_offset(b);
+        bb_emit_u64(b, 0);               /* placeholder for end address */
+        
+        bb_patch_u64(b, else_addr, bb_offset(b)); /* patch else address */
+        compile_expr(l, b);              /* compile else branch */
+        
+        bb_patch_u64(b, end_addr, bb_offset(b)); /* patch end address */
+    } else if (strcmp(head, "when") == 0) {
+        /* (when test body...)
+         * Like if with no else branch
+         */
+        compile_expr(l, b);              /* compile test */
+        bb_emit(b, OP_JEQ);              /* jump if false */
+        size_t end_addr = bb_offset(b);
+        bb_emit_u64(b, 0);               /* placeholder */
+        
+        /* Compile body expressions until ')' */
+        lex_skip(l);
+        while (l->pos < l->len && l->src[l->pos] != ')') {
+            compile_expr(l, b);
+            lex_skip(l);
+        }
+        
+        bb_patch_u64(b, end_addr, bb_offset(b));
+    } else if (strcmp(head, "unless") == 0) {
+        /* (unless test body...)
+         * Like when but inverted test
+         */
+        compile_expr(l, b);              /* compile test */
+        bb_emit(b, OP_JNE);              /* jump if true (regs[0] != 0) */
+        size_t end_addr = bb_offset(b);
+        bb_emit_u64(b, 0);               /* placeholder */
+        
+        /* Compile body expressions until ')' */
+        lex_skip(l);
+        while (l->pos < l->len && l->src[l->pos] != ')') {
+            compile_expr(l, b);
+            lex_skip(l);
+        }
+        
+        bb_patch_u64(b, end_addr, bb_offset(b));
+    } else if (strcmp(head, "cond") == 0) {
+        /* (cond (test1 expr1) (test2 expr2) ... (else exprN))
+         * Compiles to a chain of if-then-else
+         */
+        size_t jump_to_end[ELBO_MAX_COND_CLAUSES];
+        int jump_count = 0;
+        
+        lex_skip(l);
+        while (l->pos < l->len && l->src[l->pos] == '(') {
+            l->pos++; /* consume '(' */
+            lex_skip(l);
+            
+            /* Save position to check for 'else' without consuming */
+            size_t saved_pos = l->pos;
+            char clause_head[64];
+            lex_atom(l, clause_head, sizeof(clause_head));
+            
+            if (strcmp(clause_head, "else") == 0) {
+                /* else clause: just compile the body */
+                lex_skip(l);
+                while (l->pos < l->len && l->src[l->pos] != ')') {
+                    compile_expr(l, b);
+                    lex_skip(l);
+                }
+                if (l->pos < l->len && l->src[l->pos] == ')') l->pos++;
+                break;
+            } else {
+                /* Regular clause: restore position and compile test expr */
+                l->pos = saved_pos;
+                compile_expr(l, b);
+                
+                bb_emit(b, OP_JEQ);
+                size_t next_clause = bb_offset(b);
+                bb_emit_u64(b, 0);
+                
+                /* Compile body until ')' */
+                lex_skip(l);
+                while (l->pos < l->len && l->src[l->pos] != ')') {
+                    compile_expr(l, b);
+                    lex_skip(l);
+                }
+                
+                /* Jump to end after body */
+                if (jump_count < ELBO_MAX_COND_CLAUSES) {
+                    bb_emit(b, OP_JMP);
+                    jump_to_end[jump_count++] = bb_offset(b);
+                    bb_emit_u64(b, 0);
+                } else {
+                    /* Clause limit exceeded - stop processing further clauses */
+                    fprintf(stderr, "[elbo] error: cond exceeds %d clauses, skipping rest\n", 
+                            ELBO_MAX_COND_CLAUSES);
+                    if (l->pos < l->len && l->src[l->pos] == ')') l->pos++;
+                    /* Skip all remaining clauses by consuming up to closing paren */
+                    int depth = 1;
+                    while (l->pos < l->len && depth > 0) {
+                        if (l->src[l->pos] == '(') depth++;
+                        else if (l->src[l->pos] == ')') depth--;
+                        l->pos++;
+                    }
+                    break;
+                }
+                
+                bb_patch_u64(b, next_clause, bb_offset(b));
+            }
+            
+            if (l->pos < l->len && l->src[l->pos] == ')') l->pos++;
+            lex_skip(l);
+        }
+        
+        /* Patch all jumps to end */
+        for (int i = 0; i < jump_count; i++) {
+            bb_patch_u64(b, jump_to_end[i], bb_offset(b));
+        }
+    }
+    /* ─────────────────────────────────────────────────────────────────────
+     * Phase 4.1: let and define forms
+     * ───────────────────────────────────────────────────────────────────── */
+    else if (strcmp(head, "let") == 0) {
+        /* (let ((x expr) (y expr2)) body...)
+         * For stub: compile bindings, then body
+         */
+        lex_skip(l);
+        if (l->pos < l->len && l->src[l->pos] == '(') {
+            l->pos++; /* consume outer '(' for bindings */
+            lex_skip(l);
+            while (l->pos < l->len && l->src[l->pos] == '(') {
+                l->pos++; /* consume binding '(' */
+                char varname[64];
+                lex_atom(l, varname, sizeof(varname));
+                (void)varname; /* ignore name for now */
+                compile_expr(l, b); /* compile value */
+                bb_emit(b, OP_STORE); /* store to heap slot */
+                lex_skip(l);
+                if (l->pos < l->len && l->src[l->pos] == ')') l->pos++;
+                lex_skip(l);
+            }
+            if (l->pos < l->len && l->src[l->pos] == ')') l->pos++;
+        }
+        /* Compile body */
+        lex_skip(l);
+        while (l->pos < l->len && l->src[l->pos] != ')') {
+            compile_expr(l, b);
+            lex_skip(l);
+        }
+    } else if (strcmp(head, "define") == 0) {
+        /* (define name expr) */
+        char varname[64];
+        lex_atom(l, varname, sizeof(varname));
+        (void)varname;
+        compile_expr(l, b);
+        bb_emit(b, OP_STORE);
+    }
+    /* ─────────────────────────────────────────────────────────────────────
+     * Phase 4.4: Lambda and function definitions
+     * ───────────────────────────────────────────────────────────────────── */
+    else if (strcmp(head, "fn") == 0 || strcmp(head, "lambda") == 0) {
+        /* (fn (args...) body) - anonymous function
+         * For stub: skip args, compile body with call/ret frame
+         */
+        lex_skip(l);
+        if (l->pos < l->len && l->src[l->pos] == '(') {
+            l->pos++;
+            /* Skip argument list */
+            while (l->pos < l->len && l->src[l->pos] != ')') {
+                char arg[64];
+                lex_atom(l, arg, sizeof(arg));
+                (void)arg;
+                lex_skip(l);
+            }
+            if (l->pos < l->len && l->src[l->pos] == ')') l->pos++;
+        }
+        /* Compile body */
+        lex_skip(l);
+        while (l->pos < l->len && l->src[l->pos] != ')') {
+            compile_expr(l, b);
+            lex_skip(l);
+        }
+        bb_emit(b, OP_RET);
+    } else if (strcmp(head, "defun") == 0) {
+        /* (defun name (args...) body) */
+        char funcname[64];
+        lex_atom(l, funcname, sizeof(funcname));
+        (void)funcname;
+        
+        /* Skip argument list */
+        lex_skip(l);
+        if (l->pos < l->len && l->src[l->pos] == '(') {
+            l->pos++;
+            while (l->pos < l->len && l->src[l->pos] != ')') {
+                char arg[64];
+                lex_atom(l, arg, sizeof(arg));
+                (void)arg;
+                lex_skip(l);
+            }
+            if (l->pos < l->len && l->src[l->pos] == ')') l->pos++;
+        }
+        /* Compile body */
+        lex_skip(l);
+        while (l->pos < l->len && l->src[l->pos] != ')') {
+            compile_expr(l, b);
+            lex_skip(l);
+        }
+        bb_emit(b, OP_RET);
+    } else if (strcmp(head, "elbo-module") == 0) {
+        /* (elbo-module Name body...)
+         * Skip module name, then compile all body forms
+         */
+        char modname[64];
+        lex_atom(l, modname, sizeof(modname));
+        (void)modname;
+        
+        /* Compile all nested forms until closing ')' */
+        lex_skip(l);
+        while (l->pos < l->len && l->src[l->pos] != ')') {
+            compile_expr(l, b);
+            lex_skip(l);
+        }
     } else {
-        /* Unknown form — emit NOP */
+        /* Unknown form — skip all sub-expressions and emit NOP */
+        lex_skip(l);
+        while (l->pos < l->len && l->src[l->pos] != ')') {
+            compile_expr(l, b);
+            lex_skip(l);
+        }
         bb_emit(b, OP_NOP);
     }
 
@@ -186,11 +478,29 @@ static int compile_expr(Lexer* l, ByteBuffer* b) {
         l->pos++;
         return compile_list(l, b);
     }
-    /* Atom: just skip (value loading not yet supported at bytecode level) */
+    /* Atom: check if it's a number literal (Phase 4.5) */
     char atom[64];
     lex_atom(l, atom, sizeof(atom));
-    (void)atom;
-    bb_emit(b, OP_NOP);
+    
+    if (is_number(atom)) {
+        /* Emit LOAD opcode with float constant (use strtof for precision) */
+        char* endptr;
+        errno = 0;
+        float f = strtof(atom, &endptr);
+        /* Primary failure: no digits consumed. Also warn on ERANGE for overflow. */
+        if (endptr == atom) {
+            fprintf(stderr, "[elbo] warning: invalid float literal '%s'\n", atom);
+            f = 0.0f;
+        } else if (errno == ERANGE) {
+            fprintf(stderr, "[elbo] warning: float overflow/underflow '%s'\n", atom);
+            /* f will be HUGE_VALF or 0.0, use it anyway */
+        }
+        bb_emit(b, OP_LOAD);
+        bb_emit_float(b, f);
+    } else {
+        /* Symbol - emit NOP for now (would be a LOAD from symbol table) */
+        bb_emit(b, OP_NOP);
+    }
     return 0;
 }
 
@@ -237,4 +547,110 @@ ElmPackage* elbo_compile(const char* source, const char* type_name) {
     fprintf(stderr, "[elbo] compiled '%s' → %zu bytes\n",
             type_name, pkg->bytecode_size);
     return pkg;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * Phase 4.6: File-based compilation (.elbo → .elm)
+ * ───────────────────────────────────────────────────────────────────────── */
+
+/*
+ * elbo_compile_file — Read source from a file, compile, and write .elm output.
+ *
+ * The type_name is derived from the source filename (basename without extension).
+ */
+int elbo_compile_file(const char* src_path, const char* out_path) {
+    /* Read source file */
+    FILE* f = fopen(src_path, "rb");
+    if (!f) {
+        fprintf(stderr, "[elbo] failed to open source: %s\n", src_path);
+        return -1;
+    }
+    
+    fseek(f, 0, SEEK_END);
+    long fsize = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    
+    if (fsize <= 0 || fsize > ELBO_MAX_SOURCE_SIZE) {
+        fclose(f);
+        fprintf(stderr, "[elbo] invalid source file size: %ld (max: %d)\n", 
+                fsize, ELBO_MAX_SOURCE_SIZE);
+        return -1;
+    }
+    
+    char* source = malloc((size_t)fsize + 1);
+    if (!source) {
+        fclose(f);
+        fprintf(stderr, "[elbo] failed to allocate %ld bytes for source\n", fsize);
+        return -1;
+    }
+    
+    size_t read_bytes = fread(source, 1, (size_t)fsize, f);
+    fclose(f);
+    
+    if (read_bytes < (size_t)fsize) {
+        fprintf(stderr, "[elbo] short read: got %zu of %ld bytes\n", read_bytes, fsize);
+        free(source);
+        return -1;
+    }
+    source[read_bytes] = '\0';
+    
+    /* Derive type name from filename */
+    char type_name[ELM_NAME_MAX] = {0};
+    const char* basename = src_path;
+    const char* p = src_path;
+    while (*p) {
+        if (*p == '/' || *p == '\\') basename = p + 1;
+        p++;
+    }
+    /* Copy basename, strip extension */
+    size_t i = 0;
+    while (basename[i] && basename[i] != '.' && i < ELM_NAME_MAX - 1) {
+        type_name[i] = basename[i];
+        i++;
+    }
+    type_name[i] = '\0';
+    
+    /* Convert underscores to CamelCase for type name */
+    /* e.g., "concept_node" → "ConceptNode" */
+    char camel_name[ELM_NAME_MAX] = {0};
+    int camel_idx = 0;
+    int cap_next = 1;
+    for (size_t j = 0; type_name[j] && camel_idx < ELM_NAME_MAX - 1; j++) {
+        if (type_name[j] == '_') {
+            cap_next = 1;
+        } else {
+            if (cap_next) {
+                camel_name[camel_idx++] = (char)toupper((unsigned char)type_name[j]);
+            } else {
+                camel_name[camel_idx++] = type_name[j];
+            }
+            cap_next = 0;
+        }
+    }
+    camel_name[camel_idx] = '\0';
+    
+    /* Compile */
+    ElmPackage* pkg = elbo_compile(source, camel_name);
+    free(source);
+    
+    if (!pkg) {
+        fprintf(stderr, "[elbo] compilation failed for %s\n", src_path);
+        return -1;
+    }
+    
+    /* Save to .elm file */
+    int rc = elm_save(pkg, out_path);
+    
+    /* Cleanup */
+    free(pkg->dis_bytecode);
+    pthread_mutex_destroy(&pkg->ref_lock);
+    free(pkg);
+    
+    if (rc != 0) {
+        fprintf(stderr, "[elbo] failed to save %s\n", out_path);
+        return -1;
+    }
+    
+    fprintf(stderr, "[elbo] compiled %s → %s\n", src_path, out_path);
+    return 0;
 }
