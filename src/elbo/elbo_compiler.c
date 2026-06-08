@@ -22,6 +22,7 @@
 #include <string.h>
 #include <ctype.h>
 #include <math.h>
+#include <errno.h>
 
 /* Maximum size for source files (1MB) */
 #define ELBO_MAX_SOURCE_SIZE (1024 * 1024)
@@ -325,8 +326,18 @@ static int compile_list(Lexer* l, ByteBuffer* b) {
                     jump_to_end[jump_count++] = bb_offset(b);
                     bb_emit_u64(b, 0);
                 } else {
-                    fprintf(stderr, "[elbo] warning: cond exceeds %d clauses\n", 
+                    /* Clause limit exceeded - stop processing further clauses */
+                    fprintf(stderr, "[elbo] error: cond exceeds %d clauses, skipping rest\n", 
                             ELBO_MAX_COND_CLAUSES);
+                    if (l->pos < l->len && l->src[l->pos] == ')') l->pos++;
+                    /* Skip all remaining clauses by consuming up to closing paren */
+                    int depth = 1;
+                    while (l->pos < l->len && depth > 0) {
+                        if (l->src[l->pos] == '(') depth++;
+                        else if (l->src[l->pos] == ')') depth--;
+                        l->pos++;
+                    }
+                    break;
                 }
                 
                 bb_patch_u64(b, next_clause, bb_offset(b));
@@ -473,7 +484,13 @@ static int compile_expr(Lexer* l, ByteBuffer* b) {
     
     if (is_number(atom)) {
         /* Emit LOAD opcode with float constant (use strtof for precision) */
-        float f = strtof(atom, NULL);
+        char* endptr;
+        errno = 0;
+        float f = strtof(atom, &endptr);
+        if (errno != 0 || endptr == atom) {
+            fprintf(stderr, "[elbo] warning: invalid float literal '%s'\n", atom);
+            f = 0.0f;
+        }
         bb_emit(b, OP_LOAD);
         bb_emit_float(b, f);
     } else {
@@ -591,8 +608,8 @@ int elbo_compile_file(const char* src_path, const char* out_path) {
         if (type_name[j] == '_') {
             cap_next = 1;
         } else {
-            if (cap_next && type_name[j] >= 'a' && type_name[j] <= 'z') {
-                camel_name[camel_idx++] = (char)(type_name[j] - 32);
+            if (cap_next) {
+                camel_name[camel_idx++] = (char)toupper((unsigned char)type_name[j]);
             } else {
                 camel_name[camel_idx++] = type_name[j];
             }
