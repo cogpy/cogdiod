@@ -5,18 +5,23 @@
 This document constructs the full 61-definition periodic table for each of the five canonical neural network architectures: ANN (MLP), CNN, RNN, GNN, and Transformer. Each table fills all 13 primary generators + 6 composites + 42 coordinate cells, showing precisely where each architecture diverges from the canonical ANN.
 
 The 61 definitions consist of:
-- **1 Definitional Category** (Autognosis)
-- **2 Directional Categories** (Local, Global)
-- **3 Dimensional Categories** (Spatiality, Temporality, Causality)
-- **7 Organizational Categories** (Existence through Recursion)
-- **6 Composites** (Direction × Dimension)
-- **42 Cells** (Direction × Dimension × Category)
+- **13 Primary Categories (Generators):**
+  - 1 Definitional Category (Autognosis)
+  - 2 Directional Categories (Local, Global)
+  - 3 Dimensional Categories (Spatiality, Temporality, Causality)
+  - 7 Organizational Categories (Existence through Recursion)
+- **6 Composites** (Direction × Dimension = 2 × 3)
+- **42 Cells** (Direction × Dimension × Category = 2 × 3 × 7)
+
+**Total: 13 + 6 + 42 = 61 definitions**
 
 ---
 
 ## Architecture I: Feedforward ANN (Multilayer Perceptron)
 
-*The canonical baseline from Winiwarter (1999). All other architectures are variations on this theme.*
+*The canonical baseline model. This framework draws on concepts from categorical systems theory, notably Winiwarter's work on autognosis and self-referential structures (see P. Winiwarter, "Autognosis: The Theory of Hierarchical Self-generating Systems," 1999). All other architectures are variations on this foundational theme.*
+
+The ANN timeline spans key milestones: the Perceptron (Rosenblatt, 1958), backpropagation rediscovery (Rumelhart, Hinton & Williams, 1986), establishing the theoretical and practical foundation for modern deep learning.
 
 ### Primary Categories (Generators 1-13)
 
@@ -268,11 +273,11 @@ The following table shows which of the 13 primary categories each architecture f
 
 Reading this table as a directed sequence reveals the history of deep learning as a systematic exploration of the 7 organizational categories:
 
-1. **ANN (1958-1986):** Establishes the baseline — all categories at their simplest form.
-2. **CNN (1989):** Innovates at **Conjunction** (local kernel) and **Recursion** (weight sharing = translation invariance).
-3. **RNN (1990):** Innovates at **Recursion** — moves it from Global to Local, creating temporal memory.
-4. **GNN (2009):** Innovates at **Disjunction** — makes topology a dynamic input rather than a fixed constraint.
-5. **Transformer (2017):** Innovates at **Conjunction** — makes it self-referential (autognostic). The data computes its own weights.
+1. **ANN (1958-1986):** Establishes the baseline — from the Perceptron (Rosenblatt, 1958) to backpropagation (Rumelhart et al., 1986). All categories at their simplest form.
+2. **CNN (1989):** LeCun's ConvNet innovates at **Conjunction** (local kernel) and **Recursion** (weight sharing = translation invariance).
+3. **RNN (1990):** Elman networks innovate at **Recursion** — moves it from Global to Local, creating temporal memory.
+4. **GNN (2009):** Scarselli et al. innovate at **Disjunction** — makes topology a dynamic input rather than a fixed constraint.
+5. **Transformer (2017):** Vaswani et al. ("Attention Is All You Need") innovate at **Conjunction** — makes it self-referential (autognostic). The data computes its own weights.
 
 ### Prediction: The Next Architecture
 
